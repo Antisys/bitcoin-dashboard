@@ -808,6 +808,7 @@ DASHBOARD_HTML = '''<!DOCTYPE html>
         function update() {
             fetch('/api/stats').then(r => r.json()).then(d => {
                 if (d.error) {
+                    lastData = null;  // Stop interpolation on error
                     document.getElementById('statusText').textContent = 'Error';
                     document.getElementById('statusDot').className = 'status-dot status-error';
                     return;
@@ -934,7 +935,9 @@ DASHBOARD_HTML = '''<!DOCTYPE html>
                 lastFetchTime = Date.now();
 
             }).catch(e => {
+                lastData = null;  // Stop interpolation on connection error
                 document.getElementById('statusText').textContent = 'Connection Error';
+                document.getElementById('statusDot').className = 'status-dot status-error';
             });
         }
 
