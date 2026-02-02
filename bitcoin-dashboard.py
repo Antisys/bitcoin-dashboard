@@ -48,7 +48,7 @@ timed_cache = {
 
 def run_command(cmd, timeout=15):
     try:
-        if CONFIG['host'] == 'localhost' or CONFIG['host'] == '127.0.0.1':
+        if CONFIG['host'] in ['localhost', '127.0.0.1', '0.0.0.0']:
             result = subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=timeout)
         else:
             ssh_cmd = ["ssh", "-o", "ConnectTimeout=5", "-o", "StrictHostKeyChecking=no",
