@@ -1122,7 +1122,13 @@ DASHBOARD_HTML = '''<!DOCTYPE html>
                 // Bitcoin download speed
                 if (d.btc_download_speed_human) {
                     document.getElementById('btcDownload').textContent = d.btc_download_speed_human;
-                    document.getElementById('btcDownloadSub').textContent = 'upload: ' + (d.btc_upload_speed_human || '-');
+                    let speedInfo = '';
+                    if (d.assumeutxo && d.speed_top) {
+                        speedInfo = d.speed_top.toFixed(1) + ' blocks/s';
+                    } else if (d.speed) {
+                        speedInfo = d.speed.toFixed(1) + ' blocks/s';
+                    }
+                    document.getElementById('btcDownloadSub').textContent = speedInfo || 'blockchain sync';
                 }
 
                 document.getElementById('diskUsage').textContent = d.size_on_disk_human || '-';
