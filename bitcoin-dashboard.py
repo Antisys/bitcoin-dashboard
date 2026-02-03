@@ -45,6 +45,14 @@ timed_cache = {
     'connections': {'value': 0, 'in': 0, 'out': 0, 'last_update': 0, 'ttl': 60},  # 1 minute
 }
 
+# Disk I/O tracking
+prev_disk_stats = {'timestamp': 0, 'read_bytes': 0, 'write_bytes': 0}
+last_disk_result = {'disk_read_speed': 0, 'disk_write_speed': 0}
+
+# Network I/O tracking
+prev_net_stats = {'timestamp': 0, 'rx_bytes': 0, 'tx_bytes': 0}
+last_net_result = {'net_rx_speed': 0, 'net_tx_speed': 0}
+
 
 def run_command(cmd, timeout=15):
     try:
@@ -167,6 +175,119 @@ def get_cpu_stats():
     return stats
 
 
+def get_disk_io():
+    global prev_disk_stats, last_disk_result
+    stats = {}
+    current_time = time.time()
+
+    # Read disk stats from /proc/diskstats
+    diskstats = run_command("cat /proc/diskstats")
+    if not diskstats:
+        return last_disk_result.copy()
+
+    total_read = 0
+    total_write = 0
+    for line in diskstats.split('\n'):
+        parts = line.split()
+        if len(parts) >= 14:
+            device = parts[2]
+            # Only count main devices (sda, nvme0n1, etc), not partitions
+            if device.startswith('sd') and device[-1].isalpha():
+                total_read += int(parts[5]) * 512  # sectors read * 512 bytes
+                total_write += int(parts[9]) * 512  # sectors written * 512 bytes
+            elif device.startswith('nvme') and device.endswith('n1'):
+                total_read += int(parts[5]) * 512
+                total_write += int(parts[9]) * 512
+
+    if prev_disk_stats['timestamp'] > 0:
+        time_diff = current_time - prev_disk_stats['timestamp']
+        if time_diff > 0:
+            stats['disk_read_speed'] = (total_read - prev_disk_stats['read_bytes']) / time_diff
+            stats['disk_write_speed'] = (total_write - prev_disk_stats['write_bytes']) / time_diff
+            last_disk_result.update(stats)
+
+    prev_disk_stats = {'timestamp': current_time, 'read_bytes': total_read, 'write_bytes': total_write}
+
+    if not stats:
+        stats = last_disk_result.copy()
+    return stats
+
+
+def get_network_io():
+    global prev_net_stats, last_net_result
+    stats = {}
+    current_time = time.time()
+
+    # Read network stats
+    netdev = run_command("cat /proc/net/dev")
+    if not netdev:
+        return last_net_result.copy()
+
+    total_rx = 0
+    total_tx = 0
+    for line in netdev.split('\n'):
+        if ':' in line:
+            parts = line.split(':')
+            iface = parts[0].strip()
+            # Skip loopback
+            if iface == 'lo':
+                continue
+            values = parts[1].split()
+            if len(values) >= 9:
+                total_rx += int(values[0])  # bytes received
+                total_tx += int(values[8])  # bytes transmitted
+
+    if prev_net_stats['timestamp'] > 0:
+        time_diff = current_time - prev_net_stats['timestamp']
+        if time_diff > 0:
+            stats['net_rx_speed'] = (total_rx - prev_net_stats['rx_bytes']) / time_diff
+            stats['net_tx_speed'] = (total_tx - prev_net_stats['tx_bytes']) / time_diff
+            last_net_result.update(stats)
+
+    prev_net_stats = {'timestamp': current_time, 'rx_bytes': total_rx, 'tx_bytes': total_tx}
+
+    if not stats:
+        stats = last_net_result.copy()
+    return stats
+
+
+def get_mempool_stats():
+    stats = {}
+    mempool = run_bitcoin_cli("getmempoolinfo")
+    if mempool:
+        try:
+            data = json.loads(mempool)
+            stats['mempool_size'] = data.get('size', 0)
+            stats['mempool_bytes'] = data.get('bytes', 0)
+            stats['mempool_usage'] = data.get('usage', 0)
+            stats['mempool_maxmempool'] = data.get('maxmempool', 300000000)
+            stats['mempool_minfee'] = data.get('mempoolminfee', 0)
+        except json.JSONDecodeError:
+            pass
+    return stats
+
+
+def get_latest_block():
+    stats = {}
+    # Get best block hash
+    blockhash = run_bitcoin_cli("getbestblockhash")
+    if blockhash:
+        blockinfo = run_bitcoin_cli(f"getblock {blockhash}")
+        if blockinfo:
+            try:
+                data = json.loads(blockinfo)
+                stats['latest_block_height'] = data.get('height', 0)
+                stats['latest_block_time'] = data.get('time', 0)
+                stats['latest_block_txcount'] = data.get('nTx', 0)
+                stats['latest_block_size'] = data.get('size', 0)
+                # Calculate time since block
+                if stats['latest_block_time']:
+                    stats['latest_block_age'] = int(time.time()) - stats['latest_block_time']
+            except json.JSONDecodeError:
+                pass
+    return stats
+
+
 def get_system_stats():
     stats = {}
     # Cache static CPU info
@@ -208,116 +329,6 @@ def get_system_stats():
             pass
     return stats
 
-
-
-
-def get_disk_io():
-    global prev_disk_stats, last_disk_result
-    stats = {}
-    diskstats = run_command("cat /proc/diskstats")
-    if not diskstats:
-        return last_disk_result
-    
-    current_time = time.time()
-    read_sectors = write_sectors = 0
-    
-    for line in diskstats.split("\n"):
-        parts = line.split()
-        if len(parts) >= 14:
-            dev = parts[2]
-            if dev in ["nvme0n1", "sda", "sdb"]:
-                try:
-                    read_sectors += int(parts[5])
-                    write_sectors += int(parts[9])
-                except (ValueError, IndexError):
-                    pass
-    
-    read_bytes = read_sectors * 512
-    write_bytes = write_sectors * 512
-    
-    if prev_disk_stats["timestamp"] > 0:
-        time_delta = current_time - prev_disk_stats["timestamp"]
-        if time_delta > 0:
-            read_delta = read_bytes - prev_disk_stats["read_bytes"]
-            write_delta = write_bytes - prev_disk_stats["write_bytes"]
-            stats["disk_read_speed"] = max(0, read_delta / time_delta)
-            stats["disk_write_speed"] = max(0, write_delta / time_delta)
-            last_disk_result = stats.copy()
-    
-    prev_disk_stats = {"timestamp": current_time, "read_bytes": read_bytes, "write_bytes": write_bytes}
-    return stats if stats else last_disk_result
-
-
-def get_network_io():
-    global prev_net_stats, last_net_result
-    stats = {}
-    netdev = run_command("cat /proc/net/dev")
-    if not netdev:
-        return last_net_result
-    
-    current_time = time.time()
-    rx_bytes = tx_bytes = 0
-    
-    for line in netdev.split("\n"):
-        if ":" in line:
-            parts = line.split(":")
-            iface = parts[0].strip()
-            if iface not in ["lo"]:
-                try:
-                    values = parts[1].split()
-                    rx_bytes += int(values[0])
-                    tx_bytes += int(values[8])
-                except (ValueError, IndexError):
-                    pass
-    
-    if prev_net_stats["timestamp"] > 0:
-        time_delta = current_time - prev_net_stats["timestamp"]
-        if time_delta > 0:
-            stats["net_rx_speed"] = max(0, (rx_bytes - prev_net_stats["rx_bytes"]) / time_delta)
-            stats["net_tx_speed"] = max(0, (tx_bytes - prev_net_stats["tx_bytes"]) / time_delta)
-            last_net_result = stats.copy()
-    
-    prev_net_stats = {"timestamp": current_time, "rx_bytes": rx_bytes, "tx_bytes": tx_bytes}
-    return stats if stats else last_net_result
-
-
-def get_mempool_stats():
-    stats = {}
-    mempool = run_bitcoin_cli("getmempoolinfo")
-    if mempool:
-        try:
-            data = json.loads(mempool)
-            stats["mempool_size"] = data.get("size", 0)
-            stats["mempool_bytes"] = data.get("bytes", 0)
-        except json.JSONDecodeError:
-            pass
-    return stats
-
-
-def get_latest_block():
-    stats = {}
-    bestblockhash = run_bitcoin_cli("getbestblockhash")
-    if bestblockhash:
-        blockinfo = run_bitcoin_cli(f"getblock {bestblockhash}")
-        if blockinfo:
-            try:
-                data = json.loads(blockinfo)
-                stats["latest_hash"] = data.get("hash", "")[:12] + "..."
-                stats["latest_height"] = data.get("height", 0)
-                stats["latest_txcount"] = data.get("nTx", 0)
-                stats["latest_size"] = data.get("size", 0)
-                block_time = data.get("time", 0)
-                if block_time:
-                    age = int(time.time()) - block_time
-                    if age < 60:
-                        stats["latest_age"] = f"{age}s ago"
-                    elif age < 3600:
-                        stats["latest_age"] = f"{age//60}m ago"
-                    else:
-                        stats["latest_age"] = f"{age//3600}h {(age%3600)//60}m ago"
-            except json.JSONDecodeError:
-                pass
-    return stats
 
 def get_bitcoin_stats():
     global mode_tracker
@@ -538,6 +549,15 @@ def format_bytes(b):
             return f"{b:.1f} {unit}"
         b /= 1024
     return f"{b:.1f} PB"
+
+
+def format_speed(bps):
+    if bps < 1024:
+        return f"{bps:.0f} B/s"
+    elif bps < 1024 * 1024:
+        return f"{bps/1024:.1f} KB/s"
+    else:
+        return f"{bps/(1024*1024):.1f} MB/s"
 
 
 DASHBOARD_HTML = '''<!DOCTYPE html>
@@ -778,29 +798,33 @@ DASHBOARD_HTML = '''<!DOCTYPE html>
                 <div class="card-sub" id="diskSub">-</div>
             </div>
             <div class="card">
-                <div class="card-title">Disk I/O</div>
-                <div class="card-value" id="diskIO">-</div>
-                <div class="card-sub" id="diskIOSub">R: - / W: -</div>
-            </div>
-            <div class="card">
-                <div class="card-title">Network</div>
-                <div class="card-value" id="netIO">-</div>
-                <div class="card-sub" id="netIOSub">↓ - / ↑ -</div>
-            </div>
-            <div class="card">
-                <div class="card-title">Mempool</div>
-                <div class="card-value" id="mempool">-</div>
-                <div class="card-sub" id="mempoolSub">- txs</div>
-            </div>
-            <div class="card">
-                <div class="card-title">Latest Block</div>
-                <div class="card-value-small" id="latestBlock">-</div>
-                <div class="card-sub" id="latestBlockSub">-</div>
-            </div>
-            <div class="card">
                 <div class="card-title">Version</div>
                 <div class="card-value-small" id="version">-</div>
                 <div class="card-sub" id="versionSub">-</div>
+            </div>
+            <div class="card">
+                <div class="card-title">Latest Block</div>
+                <div class="card-value" id="latestBlock">-</div>
+                <div class="card-sub" id="latestBlockSub">-</div>
+            </div>
+        </div>
+
+        <h2>Mempool</h2>
+        <div class="grid">
+            <div class="card">
+                <div class="card-title">Transactions</div>
+                <div class="card-value" id="mempoolTx">-</div>
+                <div class="card-sub" id="mempoolTxSub">pending transactions</div>
+            </div>
+            <div class="card">
+                <div class="card-title">Mempool Size</div>
+                <div class="card-value" id="mempoolSize">-</div>
+                <div class="card-sub" id="mempoolSizeSub">-</div>
+            </div>
+            <div class="card">
+                <div class="card-title">Min Fee</div>
+                <div class="card-value" id="mempoolFee">-</div>
+                <div class="card-sub">sat/vB minimum</div>
             </div>
         </div>
 
@@ -821,6 +845,16 @@ DASHBOARD_HTML = '''<!DOCTYPE html>
                 <div class="card-title">Memory</div>
                 <div class="card-value" id="memUsage">-</div>
                 <div class="card-sub" id="memDetails">-</div>
+            </div>
+            <div class="card">
+                <div class="card-title">Disk I/O</div>
+                <div class="card-value" id="diskIO">-</div>
+                <div class="card-sub" id="diskIOSub">-</div>
+            </div>
+            <div class="card">
+                <div class="card-title">Network</div>
+                <div class="card-value" id="netIO">-</div>
+                <div class="card-sub" id="netIOSub">-</div>
             </div>
             <div class="card">
                 <div class="card-title">Uptime</div>
@@ -913,6 +947,16 @@ DASHBOARD_HTML = '''<!DOCTYPE html>
                 }
                 if (d.uptime_human) {
                     document.getElementById('uptime').textContent = d.uptime_human;
+                }
+                // Disk I/O
+                if (d.disk_read_speed_human) {
+                    document.getElementById('diskIO').textContent = d.disk_read_speed_human;
+                    document.getElementById('diskIOSub').textContent = 'Write: ' + (d.disk_write_speed_human || '-');
+                }
+                // Network I/O
+                if (d.net_rx_speed_human) {
+                    document.getElementById('netIO').textContent = d.net_rx_speed_human + ' in';
+                    document.getElementById('netIOSub').textContent = (d.net_tx_speed_human || '-') + ' out';
                 }
             }).catch(() => {});
         }
@@ -1045,6 +1089,37 @@ DASHBOARD_HTML = '''<!DOCTYPE html>
 
                 document.getElementById('version').textContent = (d.version || '-').replace(/\\//g, '');
 
+                // Latest block
+                if (d.latest_block_height) {
+                    document.getElementById('latestBlock').textContent = fmt(d.latest_block_height);
+                    let blockInfo = (d.latest_block_txcount || 0) + ' txs';
+                    if (d.latest_block_age !== undefined) {
+                        if (d.latest_block_age < 60) {
+                            blockInfo += ' | ' + d.latest_block_age + 's ago';
+                        } else if (d.latest_block_age < 3600) {
+                            blockInfo += ' | ' + Math.floor(d.latest_block_age / 60) + 'm ago';
+                        } else {
+                            blockInfo += ' | ' + Math.floor(d.latest_block_age / 3600) + 'h ago';
+                        }
+                    }
+                    document.getElementById('latestBlockSub').textContent = blockInfo;
+                }
+
+                // Mempool stats
+                if (d.mempool_size !== undefined) {
+                    document.getElementById('mempoolTx').textContent = fmt(d.mempool_size);
+                }
+                if (d.mempool_bytes !== undefined) {
+                    const mb = d.mempool_bytes / (1024 * 1024);
+                    const maxMb = (d.mempool_maxmempool || 300000000) / (1024 * 1024);
+                    document.getElementById('mempoolSize').textContent = mb.toFixed(1) + ' MB';
+                    document.getElementById('mempoolSizeSub').textContent = 'of ' + maxMb.toFixed(0) + ' MB max';
+                }
+                if (d.mempool_minfee !== undefined) {
+                    const satPerVb = d.mempool_minfee * 100000;
+                    document.getElementById('mempoolFee').textContent = satPerVb.toFixed(2);
+                }
+
                 // System stats
                 if (d.cpu_total_used !== undefined) {
                     document.getElementById('cpuUsage').textContent = d.cpu_total_used.toFixed(1) + '%';
@@ -1055,6 +1130,18 @@ DASHBOARD_HTML = '''<!DOCTYPE html>
                 if (d.mem_percent !== undefined) {
                     document.getElementById('memUsage').textContent = d.mem_percent.toFixed(0) + '%';
                     document.getElementById('memDetails').textContent = (d.mem_used_human||'-') + ' / ' + (d.mem_total_human||'-');
+                }
+
+                // Disk I/O
+                if (d.disk_read_speed_human) {
+                    document.getElementById('diskIO').textContent = d.disk_read_speed_human;
+                    document.getElementById('diskIOSub').textContent = 'Write: ' + (d.disk_write_speed_human || '-');
+                }
+
+                // Network I/O
+                if (d.net_rx_speed_human) {
+                    document.getElementById('netIO').textContent = d.net_rx_speed_human + ' in';
+                    document.getElementById('netIOSub').textContent = (d.net_tx_speed_human || '-') + ' out';
                 }
 
                 document.getElementById('uptime').textContent = d.uptime_human || '-';
@@ -1111,20 +1198,25 @@ class DashboardHandler(http.server.BaseHTTPRequestHandler):
                 stats['size_on_disk_human'] = format_bytes(stats.get('size_on_disk', 0))
                 sys_stats = get_system_stats()
                 stats.update(sys_stats)
-                # New monitoring stats
-                stats.update(get_disk_io())
-                stats.update(get_network_io())
-                stats.update(get_mempool_stats())
-                stats.update(get_latest_block())
-                # Format speeds
-                stats["disk_read_human"] = format_bytes(stats.get("disk_read_speed", 0)) + "/s"
-                stats["disk_write_human"] = format_bytes(stats.get("disk_write_speed", 0)) + "/s"
-                stats["net_rx_human"] = format_bytes(stats.get("net_rx_speed", 0)) + "/s"
-                stats["net_tx_human"] = format_bytes(stats.get("net_tx_speed", 0)) + "/s"
-                stats["mempool_bytes_human"] = format_bytes(stats.get("mempool_bytes", 0))
                 if 'mem_total' in stats:
                     stats['mem_total_human'] = format_bytes(stats['mem_total'])
                     stats['mem_used_human'] = format_bytes(stats['mem_used'])
+                # Add disk I/O
+                disk_io = get_disk_io()
+                stats.update(disk_io)
+                stats['disk_read_speed_human'] = format_speed(disk_io.get('disk_read_speed', 0))
+                stats['disk_write_speed_human'] = format_speed(disk_io.get('disk_write_speed', 0))
+                # Add network I/O
+                net_io = get_network_io()
+                stats.update(net_io)
+                stats['net_rx_speed_human'] = format_speed(net_io.get('net_rx_speed', 0))
+                stats['net_tx_speed_human'] = format_speed(net_io.get('net_tx_speed', 0))
+                # Add mempool stats
+                mempool = get_mempool_stats()
+                stats.update(mempool)
+                # Add latest block
+                latest = get_latest_block()
+                stats.update(latest)
             else:
                 stats = {'error': 'Could not fetch stats'}
 
@@ -1140,6 +1232,16 @@ class DashboardHandler(http.server.BaseHTTPRequestHandler):
             if 'mem_total' in stats:
                 stats['mem_total_human'] = format_bytes(stats['mem_total'])
                 stats['mem_used_human'] = format_bytes(stats['mem_used'])
+            # Add disk I/O
+            disk_io = get_disk_io()
+            stats.update(disk_io)
+            stats['disk_read_speed_human'] = format_speed(disk_io.get('disk_read_speed', 0))
+            stats['disk_write_speed_human'] = format_speed(disk_io.get('disk_write_speed', 0))
+            # Add network I/O
+            net_io = get_network_io()
+            stats.update(net_io)
+            stats['net_rx_speed_human'] = format_speed(net_io.get('net_rx_speed', 0))
+            stats['net_tx_speed_human'] = format_speed(net_io.get('net_tx_speed', 0))
             self.wfile.write(json.dumps(stats).encode())
 
         elif path == '/health':
