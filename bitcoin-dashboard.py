@@ -209,6 +209,116 @@ def get_system_stats():
     return stats
 
 
+
+
+def get_disk_io():
+    global prev_disk_stats, last_disk_result
+    stats = {}
+    diskstats = run_command("cat /proc/diskstats")
+    if not diskstats:
+        return last_disk_result
+    
+    current_time = time.time()
+    read_sectors = write_sectors = 0
+    
+    for line in diskstats.split("\n"):
+        parts = line.split()
+        if len(parts) >= 14:
+            dev = parts[2]
+            if dev in ["nvme0n1", "sda", "sdb"]:
+                try:
+                    read_sectors += int(parts[5])
+                    write_sectors += int(parts[9])
+                except (ValueError, IndexError):
+                    pass
+    
+    read_bytes = read_sectors * 512
+    write_bytes = write_sectors * 512
+    
+    if prev_disk_stats["timestamp"] > 0:
+        time_delta = current_time - prev_disk_stats["timestamp"]
+        if time_delta > 0:
+            read_delta = read_bytes - prev_disk_stats["read_bytes"]
+            write_delta = write_bytes - prev_disk_stats["write_bytes"]
+            stats["disk_read_speed"] = max(0, read_delta / time_delta)
+            stats["disk_write_speed"] = max(0, write_delta / time_delta)
+            last_disk_result = stats.copy()
+    
+    prev_disk_stats = {"timestamp": current_time, "read_bytes": read_bytes, "write_bytes": write_bytes}
+    return stats if stats else last_disk_result
+
+
+def get_network_io():
+    global prev_net_stats, last_net_result
+    stats = {}
+    netdev = run_command("cat /proc/net/dev")
+    if not netdev:
+        return last_net_result
+    
+    current_time = time.time()
+    rx_bytes = tx_bytes = 0
+    
+    for line in netdev.split("\n"):
+        if ":" in line:
+            parts = line.split(":")
+            iface = parts[0].strip()
+            if iface not in ["lo"]:
+                try:
+                    values = parts[1].split()
+                    rx_bytes += int(values[0])
+                    tx_bytes += int(values[8])
+                except (ValueError, IndexError):
+                    pass
+    
+    if prev_net_stats["timestamp"] > 0:
+        time_delta = current_time - prev_net_stats["timestamp"]
+        if time_delta > 0:
+            stats["net_rx_speed"] = max(0, (rx_bytes - prev_net_stats["rx_bytes"]) / time_delta)
+            stats["net_tx_speed"] = max(0, (tx_bytes - prev_net_stats["tx_bytes"]) / time_delta)
+            last_net_result = stats.copy()
+    
+    prev_net_stats = {"timestamp": current_time, "rx_bytes": rx_bytes, "tx_bytes": tx_bytes}
+    return stats if stats else last_net_result
+
+
+def get_mempool_stats():
+    stats = {}
+    mempool = run_bitcoin_cli("getmempoolinfo")
+    if mempool:
+        try:
+            data = json.loads(mempool)
+            stats["mempool_size"] = data.get("size", 0)
+            stats["mempool_bytes"] = data.get("bytes", 0)
+        except json.JSONDecodeError:
+            pass
+    return stats
+
+
+def get_latest_block():
+    stats = {}
+    bestblockhash = run_bitcoin_cli("getbestblockhash")
+    if bestblockhash:
+        blockinfo = run_bitcoin_cli(f"getblock {bestblockhash}")
+        if blockinfo:
+            try:
+                data = json.loads(blockinfo)
+                stats["latest_hash"] = data.get("hash", "")[:12] + "..."
+                stats["latest_height"] = data.get("height", 0)
+                stats["latest_txcount"] = data.get("nTx", 0)
+                stats["latest_size"] = data.get("size", 0)
+                block_time = data.get("time", 0)
+                if block_time:
+                    age = int(time.time()) - block_time
+                    if age < 60:
+                        stats["latest_age"] = f"{age}s ago"
+                    elif age < 3600:
+                        stats["latest_age"] = f"{age//60}m ago"
+                    else:
+                        stats["latest_age"] = f"{age//3600}h {(age%3600)//60}m ago"
+            except json.JSONDecodeError:
+                pass
+    return stats
+
 def get_bitcoin_stats():
     global mode_tracker
     stats = {'sync_mode': 'normal', 'assumeutxo': False, 'mode_confirmed': False}
@@ -668,6 +778,26 @@ DASHBOARD_HTML = '''<!DOCTYPE html>
                 <div class="card-sub" id="diskSub">-</div>
             </div>
             <div class="card">
+                <div class="card-title">Disk I/O</div>
+                <div class="card-value" id="diskIO">-</div>
+                <div class="card-sub" id="diskIOSub">R: - / W: -</div>
+            </div>
+            <div class="card">
+                <div class="card-title">Network</div>
+                <div class="card-value" id="netIO">-</div>
+                <div class="card-sub" id="netIOSub">↓ - / ↑ -</div>
+            </div>
+            <div class="card">
+                <div class="card-title">Mempool</div>
+                <div class="card-value" id="mempool">-</div>
+                <div class="card-sub" id="mempoolSub">- txs</div>
+            </div>
+            <div class="card">
+                <div class="card-title">Latest Block</div>
+                <div class="card-value-small" id="latestBlock">-</div>
+                <div class="card-sub" id="latestBlockSub">-</div>
+            </div>
+            <div class="card">
                 <div class="card-title">Version</div>
                 <div class="card-value-small" id="version">-</div>
                 <div class="card-sub" id="versionSub">-</div>
@@ -981,6 +1111,17 @@ class DashboardHandler(http.server.BaseHTTPRequestHandler):
                 stats['size_on_disk_human'] = format_bytes(stats.get('size_on_disk', 0))
                 sys_stats = get_system_stats()
                 stats.update(sys_stats)
+                # New monitoring stats
+                stats.update(get_disk_io())
+                stats.update(get_network_io())
+                stats.update(get_mempool_stats())
+                stats.update(get_latest_block())
+                # Format speeds
+                stats["disk_read_human"] = format_bytes(stats.get("disk_read_speed", 0)) + "/s"
+                stats["disk_write_human"] = format_bytes(stats.get("disk_write_speed", 0)) + "/s"
+                stats["net_rx_human"] = format_bytes(stats.get("net_rx_speed", 0)) + "/s"
+                stats["net_tx_human"] = format_bytes(stats.get("net_tx_speed", 0)) + "/s"
+                stats["mempool_bytes_human"] = format_bytes(stats.get("mempool_bytes", 0))
                 if 'mem_total' in stats:
                     stats['mem_total_human'] = format_bytes(stats['mem_total'])
                     stats['mem_used_human'] = format_bytes(stats['mem_used'])
