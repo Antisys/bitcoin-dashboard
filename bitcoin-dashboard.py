@@ -43,9 +43,9 @@ history_bottom = deque(maxlen=60)
 # Extended history for chart (keep last 30 minutes at 1-minute intervals)
 chart_history = deque(maxlen=30)
 
-# Knots peer preference settings
+# Knots peer preference settings (enabled by default)
 knots_pref = {
-    'enabled': False,
+    'enabled': True,
     'min_connections': 8,
     'last_disconnect': 0,
     'cooldown': 300,  # 5 minutes between disconnects
