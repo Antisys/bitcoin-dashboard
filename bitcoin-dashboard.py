@@ -2408,10 +2408,10 @@ DASHBOARD_HTML = '''<!DOCTYPE html>
                 case '?':
                     // Show keyboard shortcuts help
                     e.preventDefault();
-                    alert('Keyboard Shortcuts:\n\n' +
-                          'R - Refresh now\n' +
-                          'S - Settings\n' +
-                          'F - Fullscreen\n' +
+                    alert('Keyboard Shortcuts:\\n\\n' +
+                          'R - Refresh now\\n' +
+                          'S - Settings\\n' +
+                          'F - Fullscreen\\n' +
                           '? - Show this help');
                     break;
             }
