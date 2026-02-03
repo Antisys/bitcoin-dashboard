@@ -17,6 +17,8 @@ import argparse
 import os
 from urllib.parse import urlparse
 from collections import deque
+from concurrent.futures import ThreadPoolExecutor, as_completed
+import threading
 
 CONFIG = {
     'host': 'localhost',
@@ -75,6 +77,12 @@ last_net_result = {'net_rx_speed': 0, 'net_tx_speed': 0}
 prev_btc_net = {'timestamp': 0, 'totalbytesrecv': 0, 'totalbytessent': 0}
 last_btc_net_result = {'btc_download_speed': 0, 'btc_upload_speed': 0}
 
+# Thread pool for parallel RPC calls (max 6 concurrent calls)
+rpc_executor = ThreadPoolExecutor(max_workers=6, thread_name_prefix='rpc')
+
+# Lock for thread-safe cache access
+cache_lock = threading.Lock()
+
 
 # FIX #5: Cache expiration helper - clear stale data on backend failure
 def clear_expired_cache(cache_name, max_age=300):
@@ -115,6 +123,44 @@ def run_bitcoin_cli(rpc_cmd):
     else:
         cmd = f"bitcoin-cli -rpcconnect={CONFIG['rpc_host']} -rpcport={CONFIG['rpc_port']} {rpc_cmd}"
     return run_command(cmd)
+
+
+def run_bitcoin_cli_parallel(commands):
+    """
+    Execute multiple bitcoin-cli commands in parallel using thread pool.
+
+    Args:
+        commands: dict of {key: rpc_command} pairs
+
+    Returns:
+        dict of {key: result} pairs
+
+    Example:
+        results = run_bitcoin_cli_parallel({
+            'chainstate': 'getchainstates',
+            'network': 'getnetworkinfo',
+            'mempool': 'getmempoolinfo'
+        })
+        # Returns: {'chainstate': '...', 'network': '...', 'mempool': '...'}
+    """
+    results = {}
+    futures = {}
+
+    # Submit all commands to thread pool
+    for key, cmd in commands.items():
+        future = rpc_executor.submit(run_bitcoin_cli, cmd)
+        futures[future] = key
+
+    # Collect results as they complete
+    for future in as_completed(futures):
+        key = futures[future]
+        try:
+            results[key] = future.result()
+        except Exception as e:
+            print(f"RPC call '{key}' failed: {e}")
+            results[key] = None
+
+    return results
 
 
 def parse_proc_stat(stat_output):
@@ -646,8 +692,24 @@ def get_bitcoin_stats():
     stats = {'sync_mode': 'normal', 'assumeutxo': False, 'mode_confirmed': False}
     detected_mode = 'unknown'
 
-    # Try getchainstates first (for assumeutxo detection)
-    chainstates = run_bitcoin_cli("getchainstates")
+    # ASYNC OPTIMIZATION: Run independent RPC calls in parallel
+    now = time.time()
+    blockchain_cache = timed_cache['blockchain']
+    need_blockchain = now - blockchain_cache['last_update'] >= blockchain_cache['ttl'] or not blockchain_cache['data']
+    need_network = not static_cache['version']
+
+    # Build parallel RPC call list
+    parallel_calls = {'chainstates': 'getchainstates'}
+    if need_blockchain:
+        parallel_calls['blockchain'] = 'getblockchaininfo'
+    if need_network:
+        parallel_calls['network'] = 'getnetworkinfo'
+
+    # Execute all calls in parallel
+    rpc_results = run_bitcoin_cli_parallel(parallel_calls)
+
+    # Process chainstates result
+    chainstates = rpc_results.get('chainstates')
     if not chainstates:
         # FIX #5: Clear expired blockchain cache on RPC failure
         clear_expired_cache('blockchain', max_age=300)
@@ -696,25 +758,21 @@ def get_bitcoin_stats():
         except json.JSONDecodeError:
             detected_mode = 'unknown'
 
-    # Fallback to regular getblockchaininfo for normal mode data
-    # Use cache since this call is VERY slow (8+ seconds during sync)
-    now = time.time()
-    blockchain_cache = timed_cache['blockchain']
+    # Process getblockchaininfo result (from parallel call or cache)
     blockchain_data = None
 
-    if now - blockchain_cache['last_update'] < blockchain_cache['ttl'] and blockchain_cache['data']:
+    if blockchain_cache['data'] and not need_blockchain:
         # Use cached data
         blockchain_data = blockchain_cache['data']
-    else:
-        # Fetch new data - always fetch to get size_on_disk even in assumeutxo mode
-        info = run_bitcoin_cli("getblockchaininfo")
-        if info:
-            try:
-                blockchain_data = json.loads(info)
+    elif 'blockchain' in rpc_results and rpc_results['blockchain']:
+        # Use data from parallel call
+        try:
+            blockchain_data = json.loads(rpc_results['blockchain'])
+            with cache_lock:
                 blockchain_cache['data'] = blockchain_data
                 blockchain_cache['last_update'] = now
-            except json.JSONDecodeError:
-                pass
+        except json.JSONDecodeError:
+            pass
 
     # Use blockchain data if available
     if blockchain_data:
@@ -755,8 +813,7 @@ def get_bitcoin_stats():
     else:
         stats['mode_confirmed'] = False
 
-    # Get network info - cache version, timed cache for connections
-    now = time.time()
+    # Process network info (from parallel call or cache)
     if static_cache['version']:
         stats['version'] = static_cache['version']
         # Check if connections cache is still valid
@@ -771,29 +828,30 @@ def get_bitcoin_stats():
                 clear_expired_cache('connections', max_age=180)
             elif peerinfo:
                 try:
-                    timed_cache['connections']['value'] = int(peerinfo)
-                    timed_cache['connections']['last_update'] = now
+                    with cache_lock:
+                        timed_cache['connections']['value'] = int(peerinfo)
+                        timed_cache['connections']['last_update'] = now
                     stats['connections'] = timed_cache['connections']['value']
                     stats['connections_in'] = 0
                     stats['connections_out'] = stats['connections']
                 except ValueError:
                     stats['connections'] = timed_cache['connections']['value']
-    else:
-        netinfo = run_bitcoin_cli("getnetworkinfo")
-        if netinfo:
-            try:
-                data = json.loads(netinfo)
-                static_cache['version'] = data.get('subversion', 'unknown')
-                stats['version'] = static_cache['version']
+    elif 'network' in rpc_results and rpc_results['network']:
+        # Use data from parallel call
+        try:
+            data = json.loads(rpc_results['network'])
+            static_cache['version'] = data.get('subversion', 'unknown')
+            stats['version'] = static_cache['version']
+            with cache_lock:
                 timed_cache['connections']['value'] = data.get('connections', 0)
                 timed_cache['connections']['in'] = data.get('connections_in', 0)
                 timed_cache['connections']['out'] = data.get('connections_out', 0)
                 timed_cache['connections']['last_update'] = now
-                stats['connections'] = timed_cache['connections']['value']
-                stats['connections_in'] = timed_cache['connections']['in']
-                stats['connections_out'] = timed_cache['connections']['out']
-            except json.JSONDecodeError:
-                pass
+            stats['connections'] = timed_cache['connections']['value']
+            stats['connections_in'] = timed_cache['connections']['in']
+            stats['connections_out'] = timed_cache['connections']['out']
+        except json.JSONDecodeError:
+            pass
 
     # Get size on disk - use blockchain cache if available, otherwise use separate cache
     if 'size_on_disk' not in stats:  # Only fetch if not already set
@@ -2226,56 +2284,80 @@ class DashboardHandler(http.server.BaseHTTPRequestHandler):
             self.wfile.write(DASHBOARD_HTML.encode())
 
         elif path == '/api/stats':
+            start_time = time.time()  # Performance monitoring
             self.send_response(200)
             self.send_header('Content-type', 'application/json')
             self.send_header('Access-Control-Allow-Origin', '*')
             self.end_headers()
 
-            stats = get_bitcoin_stats()
+            # ASYNC OPTIMIZATION: Parallelize independent stats collection
+            futures = {}
+            with ThreadPoolExecutor(max_workers=8) as executor:
+                futures['bitcoin'] = executor.submit(get_bitcoin_stats)
+                futures['system'] = executor.submit(get_system_stats)
+                futures['disk_io'] = executor.submit(get_disk_io)
+                futures['net_io'] = executor.submit(get_network_io)
+                futures['mempool'] = executor.submit(get_mempool_stats)
+                futures['latest'] = executor.submit(get_latest_block)
+                futures['btc_net'] = executor.submit(get_btc_network_speed)
+                futures['temp'] = executor.submit(get_temperature)
+                futures['peers'] = executor.submit(get_peer_info)
+                futures['disk_est'] = executor.submit(get_disk_estimate)
+
+                # Wait for all to complete
+                stats = futures['bitcoin'].result()
+
             if stats:
                 stats = calculate_speed(stats)
                 stats['size_on_disk_human'] = format_bytes(stats.get('size_on_disk', 0))
-                sys_stats = get_system_stats()
+
+                # Merge all parallel results
+                sys_stats = futures['system'].result()
                 stats.update(sys_stats)
                 if 'mem_total' in stats:
                     stats['mem_total_human'] = format_bytes(stats['mem_total'])
                     stats['mem_used_human'] = format_bytes(stats['mem_used'])
-                # Add disk I/O
-                disk_io = get_disk_io()
+
+                disk_io = futures['disk_io'].result()
                 stats.update(disk_io)
                 stats['disk_read_speed_human'] = format_speed(disk_io.get('disk_read_speed', 0))
                 stats['disk_write_speed_human'] = format_speed(disk_io.get('disk_write_speed', 0))
-                # Add network I/O
-                net_io = get_network_io()
+
+                net_io = futures['net_io'].result()
                 stats.update(net_io)
                 stats['net_rx_speed_human'] = format_speed(net_io.get('net_rx_speed', 0))
                 stats['net_tx_speed_human'] = format_speed(net_io.get('net_tx_speed', 0))
-                # Add mempool stats
-                mempool = get_mempool_stats()
+
+                mempool = futures['mempool'].result()
                 stats.update(mempool)
-                # Add latest block
-                latest = get_latest_block()
+
+                latest = futures['latest'].result()
                 stats.update(latest)
-                # Add Bitcoin network speed
-                btc_net = get_btc_network_speed()
+
+                btc_net = futures['btc_net'].result()
                 stats.update(btc_net)
                 stats['btc_download_speed_human'] = format_speed(btc_net.get('btc_download_speed', 0))
                 stats['btc_upload_speed_human'] = format_speed(btc_net.get('btc_upload_speed', 0))
-                # Add temperature
-                temp = get_temperature()
+
+                temp = futures['temp'].result()
                 stats.update(temp)
-                # Add peer info
-                peers = get_peer_info()
+
+                peers = futures['peers'].result()
                 stats.update(peers)
-                # Add disk estimate
-                disk_est = get_disk_estimate()
+
+                disk_est = futures['disk_est'].result()
                 stats.update(disk_est)
+
                 # Add Knots preference status
                 stats['knots_pref_enabled'] = knots_pref['enabled']
                 stats['knots_pref_disconnected'] = knots_pref['disconnected_count']
+
                 # Run Knots preference enforcement if enabled
                 if knots_pref['enabled']:
                     enforce_knots_preference()
+
+                # Add performance timing
+                stats['api_response_time_ms'] = int((time.time() - start_time) * 1000)
             else:
                 stats = {'error': 'Could not fetch stats'}
 
