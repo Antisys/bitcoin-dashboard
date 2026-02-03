@@ -301,6 +301,83 @@ def get_mempool_stats():
     return stats
 
 
+def get_temperature():
+    stats = {}
+    # Try thermal zones (most Linux systems)
+    temp_output = run_command("cat /sys/class/thermal/thermal_zone*/temp 2>/dev/null | head -1")
+    if temp_output:
+        try:
+            # Value is in millidegrees
+            stats['cpu_temp'] = int(temp_output) / 1000.0
+        except ValueError:
+            pass
+    # Try sensors command as fallback
+    if 'cpu_temp' not in stats:
+        sensors_output = run_command("sensors 2>/dev/null | grep -i 'core 0' | head -1")
+        if sensors_output and '+' in sensors_output:
+            try:
+                temp_str = sensors_output.split('+')[1].split('°')[0]
+                stats['cpu_temp'] = float(temp_str)
+            except (ValueError, IndexError):
+                pass
+    # Try to get NVMe/SSD temp
+    nvme_temp = run_command("cat /sys/class/nvme/nvme*/hwmon*/temp1_input 2>/dev/null | head -1")
+    if nvme_temp:
+        try:
+            stats['nvme_temp'] = int(nvme_temp) / 1000.0
+        except ValueError:
+            pass
+    return stats
+
+
+def get_peer_info():
+    stats = {'peers': []}
+    peerinfo = run_bitcoin_cli("getpeerinfo")
+    if peerinfo:
+        try:
+            data = json.loads(peerinfo)
+            for peer in data[:10]:  # Limit to 10 peers
+                stats['peers'].append({
+                    'addr': peer.get('addr', ''),
+                    'subver': peer.get('subver', ''),
+                    'inbound': peer.get('inbound', False),
+                    'synced_headers': peer.get('synced_headers', 0),
+                    'synced_blocks': peer.get('synced_blocks', 0),
+                })
+            stats['peer_count'] = len(data)
+        except json.JSONDecodeError:
+            pass
+    return stats
+
+
+def get_disk_estimate():
+    stats = {}
+    # Full blockchain is approximately 650GB as of 2024, growing ~60GB/year
+    # At block 880,000 (approx current), size is ~650GB
+    ESTIMATED_FULL_SIZE_GB = 700  # Conservative estimate
+    BLOCKS_TOTAL = 880000  # Approximate current tip
+
+    info = run_bitcoin_cli("getblockchaininfo")
+    if info:
+        try:
+            data = json.loads(info)
+            current_size = data.get('size_on_disk', 0)
+            current_blocks = data.get('blocks', 0)
+            headers = data.get('headers', 0)
+
+            if current_blocks > 0 and headers > current_blocks:
+                # Estimate based on current progress
+                size_per_block = current_size / current_blocks
+                remaining_blocks = headers - current_blocks
+                estimated_remaining = size_per_block * remaining_blocks
+                stats['disk_needed_bytes'] = estimated_remaining
+                stats['disk_needed_human'] = format_bytes(estimated_remaining)
+                stats['disk_total_estimate'] = current_size + estimated_remaining
+        except json.JSONDecodeError:
+            pass
+    return stats
+
+
 def get_latest_block():
     stats = {}
     # Get best block hash
@@ -779,6 +856,32 @@ DASHBOARD_HTML = '''<!DOCTYPE html>
         .cpu-legend-iowait { background: #FF9800; }
 
         .footer { text-align: center; color: #555; margin-top: 30px; font-size: 0.9em; }
+
+        .peer-list {
+            background: rgba(255,255,255,0.05);
+            border-radius: 15px;
+            padding: 20px;
+            margin-bottom: 30px;
+            max-height: 300px;
+            overflow-y: auto;
+        }
+        .peer-row {
+            display: flex;
+            justify-content: space-between;
+            padding: 8px 0;
+            border-bottom: 1px solid rgba(255,255,255,0.1);
+            font-size: 0.85em;
+        }
+        .peer-row:last-child { border-bottom: none; }
+        .peer-addr { color: #fff; font-family: monospace; }
+        .peer-version { color: #888; font-size: 0.9em; }
+        .peer-direction {
+            padding: 2px 8px;
+            border-radius: 10px;
+            font-size: 0.8em;
+        }
+        .peer-inbound { background: #2196F3; color: white; }
+        .peer-outbound { background: #4CAF50; color: white; }
     </style>
 </head>
 <body>
@@ -836,6 +939,11 @@ DASHBOARD_HTML = '''<!DOCTYPE html>
                 <div class="card-title">Disk Usage</div>
                 <div class="card-value" id="diskUsage">-</div>
                 <div class="card-sub" id="diskSub">-</div>
+            </div>
+            <div class="card">
+                <div class="card-title">Disk Needed</div>
+                <div class="card-value" id="diskNeeded">-</div>
+                <div class="card-sub" id="diskNeededSub">estimated remaining</div>
             </div>
             <div class="card">
                 <div class="card-title">Version</div>
@@ -896,6 +1004,16 @@ DASHBOARD_HTML = '''<!DOCTYPE html>
                 <div class="card-value" id="uptime">-</div>
                 <div class="card-sub">system uptime</div>
             </div>
+            <div class="card">
+                <div class="card-title">Temperature</div>
+                <div class="card-value" id="cpuTemp">-</div>
+                <div class="card-sub" id="tempSub">-</div>
+            </div>
+        </div>
+
+        <h2>Connected Peers</h2>
+        <div class="peer-list" id="peerList">
+            <div class="card-sub">Loading peers...</div>
         </div>
 
         <div class="footer">
@@ -1137,6 +1255,14 @@ DASHBOARD_HTML = '''<!DOCTYPE html>
                 document.getElementById('diskUsage').textContent = d.size_on_disk_human || '-';
                 document.getElementById('diskSub').textContent = d.pruned ? 'pruned' : 'full node';
 
+                // Disk needed estimate
+                if (d.disk_needed_human) {
+                    document.getElementById('diskNeeded').textContent = d.disk_needed_human;
+                    document.getElementById('diskNeededSub').textContent = 'to complete sync';
+                } else {
+                    document.getElementById('diskNeeded').textContent = '-';
+                }
+
                 document.getElementById('version').textContent = (d.version || '-').replace(/\\//g, '');
 
                 // Latest block
@@ -1191,6 +1317,33 @@ DASHBOARD_HTML = '''<!DOCTYPE html>
                 }
 
                 document.getElementById('uptime').textContent = d.uptime_human || '-';
+
+                // Temperature
+                if (d.cpu_temp !== undefined) {
+                    document.getElementById('cpuTemp').textContent = d.cpu_temp.toFixed(0) + '°C';
+                    let tempSub = 'CPU';
+                    if (d.nvme_temp !== undefined) {
+                        tempSub += ' | NVMe: ' + d.nvme_temp.toFixed(0) + '°C';
+                    }
+                    document.getElementById('tempSub').textContent = tempSub;
+                }
+
+                // Peer list
+                if (d.peers && d.peers.length > 0) {
+                    let html = '';
+                    for (let p of d.peers) {
+                        const dir = p.inbound ? 'inbound' : 'outbound';
+                        const dirClass = p.inbound ? 'peer-inbound' : 'peer-outbound';
+                        const ver = (p.subver || '').replace(/\\//g, '').substring(0, 25);
+                        html += `<div class="peer-row">
+                            <span class="peer-addr">${p.addr}</span>
+                            <span class="peer-version">${ver}</span>
+                            <span class="peer-direction ${dirClass}">${dir}</span>
+                        </div>`;
+                    }
+                    document.getElementById('peerList').innerHTML = html;
+                }
+
                 document.getElementById('lastUpdate').textContent = 'Last updated: ' + new Date().toLocaleTimeString();
 
                 // Store for interpolation
@@ -1268,6 +1421,15 @@ class DashboardHandler(http.server.BaseHTTPRequestHandler):
                 stats.update(btc_net)
                 stats['btc_download_speed_human'] = format_speed(btc_net.get('btc_download_speed', 0))
                 stats['btc_upload_speed_human'] = format_speed(btc_net.get('btc_upload_speed', 0))
+                # Add temperature
+                temp = get_temperature()
+                stats.update(temp)
+                # Add peer info
+                peers = get_peer_info()
+                stats.update(peers)
+                # Add disk estimate
+                disk_est = get_disk_estimate()
+                stats.update(disk_est)
             else:
                 stats = {'error': 'Could not fetch stats'}
 
