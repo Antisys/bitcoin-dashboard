@@ -1123,8 +1123,11 @@ DASHBOARD_HTML = '''<!DOCTYPE html>
                 if (d.btc_download_speed_human) {
                     document.getElementById('btcDownload').textContent = d.btc_download_speed_human;
                     let speedInfo = '';
-                    if (d.assumeutxo && d.speed_top) {
-                        speedInfo = d.speed_top.toFixed(1) + ' blocks/s';
+                    if (d.assumeutxo) {
+                        let parts = [];
+                        if (d.speed_top) parts.push('tip: ' + d.speed_top.toFixed(1) + ' b/s');
+                        if (d.speed_bottom) parts.push('val: ' + d.speed_bottom.toFixed(1) + ' b/s');
+                        speedInfo = parts.join(' | ') || 'syncing...';
                     } else if (d.speed) {
                         speedInfo = d.speed.toFixed(1) + ' blocks/s';
                     }
