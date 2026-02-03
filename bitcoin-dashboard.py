@@ -733,6 +733,11 @@ DASHBOARD_HTML = '''<!DOCTYPE html>
         }
         .mode-assumeutxo { background: #4CAF50; color: white; }
         .mode-normal { background: #2196F3; color: white; }
+        .version-tag {
+            float: right;
+            color: #888;
+            font-size: 0.75em;
+        }
 
         .unified-bar-container {
             position: relative;
@@ -891,6 +896,7 @@ DASHBOARD_HTML = '''<!DOCTYPE html>
         <div class="progress-container">
             <span class="mode-indicator mode-normal" id="modeIndicator">Normal Sync</span>
             <span style="margin-left: 15px;"><span class="status-dot status-syncing" id="statusDot"></span><span id="statusText">Syncing...</span></span>
+            <span class="version-tag" id="version">-</span>
 
             <div class="unified-bar-container" id="unifiedBar">
                 <div class="bar-bottom" id="barBottom" style="width: 0%"></div>
@@ -944,16 +950,6 @@ DASHBOARD_HTML = '''<!DOCTYPE html>
                 <div class="card-title">Disk Needed</div>
                 <div class="card-value" id="diskNeeded">-</div>
                 <div class="card-sub" id="diskNeededSub">estimated remaining</div>
-            </div>
-            <div class="card">
-                <div class="card-title">Version</div>
-                <div class="card-value-tiny" id="version">-</div>
-                <div class="card-sub" id="versionSub">-</div>
-            </div>
-            <div class="card">
-                <div class="card-title">Latest Block</div>
-                <div class="card-value" id="latestBlock">-</div>
-                <div class="card-sub" id="latestBlockSub">-</div>
             </div>
         </div>
 
@@ -1264,22 +1260,6 @@ DASHBOARD_HTML = '''<!DOCTYPE html>
                 }
 
                 document.getElementById('version').textContent = (d.version || '-').replace(/\\//g, '');
-
-                // Latest block
-                if (d.latest_block_height) {
-                    document.getElementById('latestBlock').textContent = fmt(d.latest_block_height);
-                    let blockInfo = (d.latest_block_txcount || 0) + ' txs';
-                    if (d.latest_block_age !== undefined) {
-                        if (d.latest_block_age < 60) {
-                            blockInfo += ' | ' + d.latest_block_age + 's ago';
-                        } else if (d.latest_block_age < 3600) {
-                            blockInfo += ' | ' + Math.floor(d.latest_block_age / 60) + 'm ago';
-                        } else {
-                            blockInfo += ' | ' + Math.floor(d.latest_block_age / 3600) + 'h ago';
-                        }
-                    }
-                    document.getElementById('latestBlockSub').textContent = blockInfo;
-                }
 
                 // Mempool stats
                 if (d.mempool_size !== undefined) {
