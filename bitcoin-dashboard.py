@@ -2701,6 +2701,12 @@ def warmup_cache():
             get_peer_info()
             # Warm up system stats
             get_system_stats()
+
+            # Initialize network speed tracking (needs 2 calls to calculate speed)
+            get_btc_network_speed()  # First call establishes baseline
+            time.sleep(3)  # Wait a bit for some data transfer
+            get_btc_network_speed()  # Second call calculates initial speed
+
             print("Cache warmup complete")
         except Exception as e:
             print(f"Cache warmup failed: {e}")
