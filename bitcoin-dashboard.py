@@ -20,6 +20,14 @@ from collections import deque
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import threading
 
+# SSH connection pooling (optional, only if paramiko available)
+try:
+    import paramiko
+    PARAMIKO_AVAILABLE = True
+except ImportError:
+    PARAMIKO_AVAILABLE = False
+    paramiko = None
+
 CONFIG = {
     'host': 'localhost',
     'ssh_user': os.environ.get('USER', 'root'),
@@ -84,6 +92,93 @@ rpc_executor = ThreadPoolExecutor(max_workers=6, thread_name_prefix='rpc')
 cache_lock = threading.Lock()
 
 
+# SSH Connection Pool for persistent connections (reduces latency by 100-200ms per call)
+class SSHConnectionPool:
+    """Manages persistent SSH connections with automatic reconnection"""
+
+    def __init__(self, host, user, max_connections=3):
+        self.host = host
+        self.user = user
+        self.max_connections = max_connections
+        self.connections = []
+        self.lock = threading.Lock()
+        self.enabled = PARAMIKO_AVAILABLE and host not in ['localhost', '127.0.0.1', '0.0.0.0']
+
+    def get_connection(self):
+        """Get an available SSH connection, creating if needed"""
+        if not self.enabled:
+            return None
+
+        with self.lock:
+            # Try to reuse existing connection
+            for conn in self.connections:
+                if conn['in_use'] == False and conn['client'].get_transport() and conn['client'].get_transport().is_active():
+                    conn['in_use'] = True
+                    return conn
+
+            # Create new connection if under limit
+            if len(self.connections) < self.max_connections:
+                try:
+                    client = paramiko.SSHClient()
+                    client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+                    client.connect(self.host, username=self.user, timeout=5)
+                    conn = {'client': client, 'in_use': True}
+                    self.connections.append(conn)
+                    return conn
+                except Exception as e:
+                    print(f"SSH connection failed: {e}")
+                    return None
+
+            # All connections busy, wait for one (fallback to subprocess)
+            return None
+
+    def release_connection(self, conn):
+        """Mark connection as available for reuse"""
+        if conn and self.enabled:
+            with self.lock:
+                conn['in_use'] = False
+
+    def execute(self, cmd, timeout=15):
+        """Execute command on SSH connection"""
+        conn = self.get_connection()
+        if not conn:
+            return None  # Fallback to subprocess
+
+        try:
+            stdin, stdout, stderr = conn['client'].exec_command(cmd, timeout=timeout)
+            output = stdout.read().decode('utf-8').strip()
+            exit_code = stdout.channel.recv_exit_status()
+            self.release_connection(conn)
+
+            if exit_code == 0:
+                return output
+            return None
+        except Exception as e:
+            # Connection failed, remove it from pool
+            with self.lock:
+                if conn in self.connections:
+                    self.connections.remove(conn)
+                try:
+                    conn['client'].close()
+                except:
+                    pass
+            return None
+
+    def close_all(self):
+        """Close all SSH connections"""
+        with self.lock:
+            for conn in self.connections:
+                try:
+                    conn['client'].close()
+                except:
+                    pass
+            self.connections.clear()
+
+
+# Global SSH connection pool (initialized after CONFIG is set)
+ssh_pool = None
+
+
 # FIX #5: Cache expiration helper - clear stale data on backend failure
 def clear_expired_cache(cache_name, max_age=300):
     """Clear cache if data is older than max_age seconds (default 5 minutes)"""
@@ -103,16 +198,30 @@ def clear_expired_cache(cache_name, max_age=300):
 
 
 def run_command(cmd, timeout=15):
+    global ssh_pool
+
     try:
         if CONFIG['host'] in ['localhost', '127.0.0.1', '0.0.0.0']:
+            # Local execution
             result = subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=timeout)
+            if result.returncode == 0:
+                return result.stdout.strip()
+            return None
         else:
+            # Remote execution - try SSH pool first (100-200ms faster)
+            if ssh_pool and ssh_pool.enabled:
+                output = ssh_pool.execute(cmd, timeout)
+                if output is not None:
+                    return output
+                # Pool failed, fall through to subprocess
+
+            # Fallback to subprocess SSH (creates new connection each time)
             ssh_cmd = ["ssh", "-o", "ConnectTimeout=5", "-o", "StrictHostKeyChecking=no",
                        f"{CONFIG['ssh_user']}@{CONFIG['host']}", cmd]
             result = subprocess.run(ssh_cmd, capture_output=True, text=True, timeout=timeout)
-        if result.returncode == 0:
-            return result.stdout.strip()
-        return None
+            if result.returncode == 0:
+                return result.stdout.strip()
+            return None
     except Exception:
         return None
 
@@ -2180,11 +2289,10 @@ DASHBOARD_HTML = '''<!DOCTYPE html>
                     for (let p of peers) {
                         const dir = p.inbound ? 'in' : 'out';
                         const dirClass = p.inbound ? 'peer-inbound' : 'peer-outbound';
-                        // Clean up version string - show just the client name
+                        // Clean up version string - show full client name
                         let ver = (p.subver || '').replace(/\\//g, '');
                         // Remove trailing version numbers and clean up
                         ver = ver.replace(/^Satoshi:/, 'Core ').replace(/^Bitcoin Knots:/, 'Knots ');
-                        ver = ver.substring(0, 20);
                         // Extract just the IP without port for cleaner display
                         const addr = p.addr.split(':')[0] || p.addr;
                         html += `<div class="peer-row">
@@ -2264,6 +2372,50 @@ DASHBOARD_HTML = '''<!DOCTYPE html>
                 }
             }
         }
+
+        // Keyboard shortcuts
+        document.addEventListener('keydown', function(e) {
+            // Ignore if typing in input field
+            if (e.target.tagName === 'INPUT' || e.target.tagName === 'TEXTAREA') return;
+
+            switch(e.key.toLowerCase()) {
+                case 'r':
+                    // Refresh now
+                    e.preventDefault();
+                    console.log('Manual refresh triggered');
+                    update();
+                    updateCpu();
+                    break;
+
+                case 's':
+                    // Open settings
+                    e.preventDefault();
+                    document.getElementById('settingsModal').style.display = 'flex';
+                    break;
+
+                case 'f':
+                    // Toggle fullscreen
+                    e.preventDefault();
+                    if (!document.fullscreenElement) {
+                        document.documentElement.requestFullscreen().catch(err => {
+                            console.log('Fullscreen failed:', err);
+                        });
+                    } else {
+                        document.exitFullscreen();
+                    }
+                    break;
+
+                case '?':
+                    // Show keyboard shortcuts help
+                    e.preventDefault();
+                    alert('Keyboard Shortcuts:\n\n' +
+                          'R - Refresh now\n' +
+                          'S - Settings\n' +
+                          'F - Fullscreen\n' +
+                          '? - Show this help');
+                    break;
+            }
+        });
 
         // Initialize
         loadSettings();
@@ -2506,10 +2658,16 @@ def main():
     CONFIG['port'] = args.port
     CONFIG['docker_container'] = args.docker
 
+    # Initialize SSH connection pool for remote hosts
+    global ssh_pool
+    ssh_pool = SSHConnectionPool(CONFIG['host'], CONFIG['ssh_user'], max_connections=3)
+
     print(f"Bitcoin Knots Dashboard")
     print(f"Node: {CONFIG['host']}")
     if CONFIG['docker_container']:
         print(f"Docker: {CONFIG['docker_container']}")
+    if ssh_pool.enabled:
+        print(f"SSH Pool: Enabled (max 3 connections)")
     print(f"Dashboard: http://0.0.0.0:{CONFIG['port']}")
 
     # Start cache warmup in background
@@ -2523,6 +2681,8 @@ def main():
             httpd.serve_forever()
         except KeyboardInterrupt:
             print("\nShutting down...")
+            if ssh_pool:
+                ssh_pool.close_all()
 
 
 if __name__ == '__main__':
