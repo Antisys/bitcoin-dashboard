@@ -693,43 +693,93 @@ def enforce_knots_preference():
 
 def get_disk_estimate():
     stats = {}
-    # Recent blocks (2023-2026) average ~2-3 MB due to SegWit and increased usage
-    # Early blocks (2009-2015) were tiny (~100 KB average)
-    # Using average block size across ALL blocks severely underestimates space needed
+    # Full unpruned blockchain is ~600-650 GB as of 2025, growing ~60 GB/year
+    # Block sizes: early blocks ~100KB, modern blocks ~2-3 MB
 
+    # First get basic blockchain info
     info = run_bitcoin_cli("getblockchaininfo")
-    if info:
-        try:
-            data = json.loads(info)
-            current_size = data.get('size_on_disk', 0)
-            current_blocks = data.get('blocks', 0)
-            headers = data.get('headers', 0)
+    if not info:
+        return stats
 
-            if current_blocks > 0 and headers > current_blocks:
-                remaining_blocks = headers - current_blocks
+    try:
+        data = json.loads(info)
+        current_size = data.get('size_on_disk', 0)
+        current_blocks = data.get('blocks', 0)
+        headers = data.get('headers', 0)
+        pruned = data.get('pruned', False)
 
-                # Use realistic recent block size estimates based on current block height
-                if current_blocks >= 800000:
-                    # Modern blocks (2023+): ~2.5 MB average
-                    avg_recent_block_size = 2.5 * 1024 * 1024  # 2.5 MB in bytes
-                elif current_blocks >= 600000:
-                    # 2019-2022: ~1.5 MB average
-                    avg_recent_block_size = 1.5 * 1024 * 1024
-                else:
-                    # Older blocks: use actual average (less accurate but better than nothing)
-                    avg_recent_block_size = current_size / current_blocks if current_blocks > 0 else 1024 * 1024
+        if pruned:
+            stats['disk_estimate_note'] = 'Pruned mode - only recent blocks stored'
+            return stats
 
-                estimated_remaining = remaining_blocks * avg_recent_block_size
+        # Check if AssumeUTXO mode (dual sync)
+        chainstates_raw = run_bitcoin_cli("getchainstates")
+        is_assumeutxo = False
+        bottom_height = 0
+        top_height = current_blocks
+        snapshot_height = 840000
+
+        if chainstates_raw:
+            try:
+                cs_data = json.loads(chainstates_raw)
+                states = cs_data.get('chainstates', [])
+                if len(states) == 2:
+                    is_assumeutxo = True
+                    for state in states:
+                        if state.get('snapshot_blockhash'):
+                            top_height = state.get('blocks', 0)
+                        else:
+                            bottom_height = state.get('blocks', 0)
+            except:
+                pass
+
+        # Estimate total blockchain size when complete
+        # Use empirical data: ~600-650 GB for ~930k blocks in 2025
+        estimated_full_size = 650 * 1024 * 1024 * 1024  # 650 GB in bytes
+
+        if is_assumeutxo and not pruned:
+            # AssumeUTXO dual sync calculation
+            # Need space for: ALL blocks from 0 to headers
+            # Currently have: some early blocks (0→bottom) + recent blocks (snapshot→top)
+
+            # Estimate what percentage of full blockchain we have
+            # This is approximate since block sizes vary
+            blocks_validated_bottom = bottom_height  # 0 → bottom
+            blocks_downloaded_top = top_height - snapshot_height  # snapshot → top
+            blocks_have_approx = blocks_validated_bottom + blocks_downloaded_top
+
+            # Percentage complete (rough estimate)
+            pct_complete = blocks_have_approx / headers if headers > 0 else 0
+
+            # Estimated total needed
+            estimated_total = estimated_full_size
+            estimated_remaining = max(0, estimated_total - current_size)
+
+            stats['disk_needed_bytes'] = int(estimated_remaining)
+            stats['disk_needed_human'] = format_bytes(estimated_remaining)
+            stats['disk_total_estimate'] = estimated_total
+            stats['disk_estimate_note'] = f'AssumeUTXO: {pct_complete*100:.0f}% complete'
+
+        else:
+            # Normal sync or post-AssumeUTXO
+            if headers > current_blocks:
+                # Still syncing
+                pct_complete = current_blocks / headers if headers > 0 else 0
+                estimated_total = estimated_full_size
+                estimated_remaining = max(0, estimated_total - current_size)
+
                 stats['disk_needed_bytes'] = int(estimated_remaining)
                 stats['disk_needed_human'] = format_bytes(estimated_remaining)
-                stats['disk_total_estimate'] = current_size + estimated_remaining
+                stats['disk_total_estimate'] = estimated_total
+            else:
+                # Fully synced
+                stats['disk_needed_bytes'] = 0
+                stats['disk_needed_human'] = '0 B'
+                stats['disk_total_estimate'] = current_size
 
-                # Add note if estimate seems off
-                if remaining_blocks > 100000:
-                    stats['disk_estimate_note'] = 'Large sync remaining, estimate may vary'
+    except json.JSONDecodeError:
+        pass
 
-        except json.JSONDecodeError:
-            pass
     return stats
 
 
