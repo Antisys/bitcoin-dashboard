@@ -57,7 +57,7 @@ static_cache = {'version': None, 'pruned': None, 'cpu_model': None, 'cpu_cores':
 
 # Time-based cache for slow-changing values
 timed_cache = {
-    'size_on_disk': {'value': 0, 'last_update': 0, 'ttl': 120},  # 2 minutes
+    'size_on_disk': {'value': 0, 'pruned': None, 'last_update': 0, 'ttl': 600},  # 10 minutes - disk size grows slowly
     'connections': {'value': 0, 'in': 0, 'out': 0, 'last_update': 0, 'ttl': 60},  # 1 minute
     'peers': {'value': [], 'count': 0, 'knots': 0, 'core': 0, 'last_update': 0, 'ttl': 45},  # 45 seconds
     'blockchain': {'data': None, 'last_update': 0, 'ttl': 30},  # 30 seconds - getblockchaininfo is VERY slow during sync
@@ -776,9 +776,24 @@ def get_bitcoin_stats():
 
     # Use blockchain data if available
     if blockchain_data:
-        # Always get size_on_disk and pruned status
-        stats['size_on_disk'] = blockchain_data.get('size_on_disk', 0)
-        stats['pruned'] = blockchain_data.get('pruned', False)
+        # OPTIMIZATION: Use separate size_on_disk cache with long TTL (10 min)
+        # Check if we have cached size_on_disk that's still valid
+        size_cache = timed_cache['size_on_disk']
+        if now - size_cache['last_update'] < size_cache['ttl']:
+            # Use cached size_on_disk (valid for 10 minutes)
+            stats['size_on_disk'] = size_cache['value']
+            stats['pruned'] = size_cache['pruned'] if size_cache['pruned'] is not None else False
+        else:
+            # Cache expired, extract from fresh blockchain data and update cache
+            stats['size_on_disk'] = blockchain_data.get('size_on_disk', 0)
+            stats['pruned'] = blockchain_data.get('pruned', False)
+            with cache_lock:
+                size_cache['value'] = stats['size_on_disk']
+                size_cache['pruned'] = stats['pruned']
+                size_cache['last_update'] = now
+
+        # Store pruned in static cache for other code paths
+        static_cache['pruned'] = stats['pruned']
 
         # Only use height/headers/progress in normal mode (assumeutxo gets these from getchainstates)
         if not stats.get('assumeutxo'):
@@ -853,22 +868,23 @@ def get_bitcoin_stats():
         except json.JSONDecodeError:
             pass
 
-    # Get size on disk - use blockchain cache if available, otherwise use separate cache
-    if 'size_on_disk' not in stats:  # Only fetch if not already set
-        now = time.time()
-        # First try to use blockchain cache (already fetched above)
-        blockchain_cache = timed_cache['blockchain']
-        if blockchain_cache['data'] and now - blockchain_cache['last_update'] < 120:  # 2 min for size
-            stats['size_on_disk'] = blockchain_cache['data'].get('size_on_disk', 0)
-            stats['pruned'] = blockchain_cache['data'].get('pruned', False)
-            static_cache['pruned'] = stats['pruned']
-        elif now - timed_cache['size_on_disk']['last_update'] < timed_cache['size_on_disk']['ttl']:
-            # Use old separate cache if blockchain cache not available
-            stats['size_on_disk'] = timed_cache['size_on_disk']['value']
-            if static_cache['pruned'] is not None:
-                stats['pruned'] = static_cache['pruned']
+    # Fallback: If blockchain_data was not available, try separate size_on_disk cache
+    if 'size_on_disk' not in stats:
+        size_cache = timed_cache['size_on_disk']
+        if now - size_cache['last_update'] < size_cache['ttl']:
+            # Use cached size_on_disk (valid for 10 minutes)
+            stats['size_on_disk'] = size_cache['value']
+            stats['pruned'] = size_cache['pruned'] if size_cache['pruned'] is not None else static_cache['pruned']
+        # If even the long cache is expired and blockchain_data failed, size_on_disk will be missing
+        # Frontend will handle this gracefully
 
     stats['timestamp'] = time.time()
+
+    # Debug: Add cache age for size_on_disk (helps verify 10-minute caching works)
+    if 'size_on_disk' in stats:
+        size_cache_age = int(stats['timestamp'] - timed_cache['size_on_disk']['last_update'])
+        stats['size_on_disk_cache_age_sec'] = size_cache_age
+
     return stats
 
 
