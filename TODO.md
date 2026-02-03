@@ -1,6 +1,6 @@
 # Bitcoin Dashboard - TODO
 
-## High Priority (In Progress)
+## High Priority (Completed)
 - [x] Disk I/O monitoring - read/write speeds
 - [x] Network bandwidth - download/upload speeds  
 - [x] Mempool stats - size, tx count
@@ -8,9 +8,9 @@
 
 ## Medium Priority
 - [ ] Historical sync chart - line graph of blocks/sec over time
-- [ ] Peer map/list - show connected peer details
-- [ ] Estimated disk needed - "Will need ~X GB more space"
-- [ ] Temperature monitoring - CPU/SSD temps if available
+- [x] Peer map/list - show connected peer details
+- [x] Estimated disk needed - "Will need ~X GB more space"
+- [x] Temperature monitoring - CPU/SSD temps if available
 - [ ] Configuration settings page - edit settings via UI
 
 ## Nice to Have
@@ -24,5 +24,7 @@
 - None currently known
 
 ## Recently Completed
+- 2026-02-03: Added temperature, peer list, disk estimate
+- 2026-02-03: Added download speed with blocks/s, split for AssumeUTXO
 - 2026-02-03: Added disk I/O, network, mempool, latest block monitoring
 - 2026-02-02: Fixed 0.0.0.0 host detection for local bitcoin-cli
