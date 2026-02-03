@@ -76,6 +76,24 @@ prev_btc_net = {'timestamp': 0, 'totalbytesrecv': 0, 'totalbytessent': 0}
 last_btc_net_result = {'btc_download_speed': 0, 'btc_upload_speed': 0}
 
 
+# FIX #5: Cache expiration helper - clear stale data on backend failure
+def clear_expired_cache(cache_name, max_age=300):
+    """Clear cache if data is older than max_age seconds (default 5 minutes)"""
+    if cache_name not in timed_cache:
+        return
+    cache = timed_cache[cache_name]
+    now = time.time()
+    age = now - cache['last_update']
+    # If data is older than max_age, clear it
+    if age > max_age:
+        if 'data' in cache:
+            cache['data'] = None
+        if 'value' in cache:
+            cache['value'] = 0
+        cache['last_update'] = 0
+        print(f"Cleared stale cache '{cache_name}' (age: {age:.0f}s)")
+
+
 def run_command(cmd, timeout=15):
     try:
         if CONFIG['host'] in ['localhost', '127.0.0.1', '0.0.0.0']:
@@ -312,6 +330,11 @@ def get_mempool_stats():
 
     stats = {}
     mempool = run_bitcoin_cli("getmempoolinfo")
+    if not mempool:
+        # FIX #5: Clear expired mempool cache on RPC failure
+        clear_expired_cache('mempool', max_age=180)
+        return stats
+
     if mempool:
         try:
             data = json.loads(mempool)
@@ -551,6 +574,11 @@ def get_latest_block():
     stats = {}
     # Get best block hash
     blockhash = run_bitcoin_cli("getbestblockhash")
+    if not blockhash:
+        # FIX #5: Clear expired latest_block cache on RPC failure
+        clear_expired_cache('latest_block', max_age=180)
+        return stats
+
     if blockhash:
         blockinfo = run_bitcoin_cli(f"getblock {blockhash}")
         if blockinfo:
@@ -620,6 +648,10 @@ def get_bitcoin_stats():
 
     # Try getchainstates first (for assumeutxo detection)
     chainstates = run_bitcoin_cli("getchainstates")
+    if not chainstates:
+        # FIX #5: Clear expired blockchain cache on RPC failure
+        clear_expired_cache('blockchain', max_age=300)
+
     if chainstates:
         try:
             data = json.loads(chainstates)
@@ -731,7 +763,10 @@ def get_bitcoin_stats():
             stats['connections_out'] = timed_cache['connections']['out']
         else:
             peerinfo = run_bitcoin_cli("getconnectioncount")
-            if peerinfo:
+            if not peerinfo:
+                # FIX #5: Clear expired connections cache on RPC failure
+                clear_expired_cache('connections', max_age=180)
+            elif peerinfo:
                 try:
                     timed_cache['connections']['value'] = int(peerinfo)
                     timed_cache['connections']['last_update'] = now
@@ -1479,6 +1514,17 @@ DASHBOARD_HTML = '''<!DOCTYPE html>
         let blockRefreshInterval = null;
         let cpuRefreshInterval = null;
 
+        // FIX #2: Request-in-flight tracking to prevent stacking
+        let updateInFlight = false;
+        let updateCpuInFlight = false;
+
+        // FIX #4: Backend health tracking
+        let backendHealth = {
+            consecutiveFailures: 0,
+            lastSuccessTime: Date.now(),
+            isHealthy: true
+        };
+
         // Settings
         const defaultSettings = {
             theme: 'dark',
@@ -1715,32 +1761,74 @@ DASHBOARD_HTML = '''<!DOCTYPE html>
         }
 
         function updateCpu() {
-            fetch('/api/cpu').then(r => r.json()).then(d => {
-                if (d.cpu_total_used !== undefined) {
-                    document.getElementById('cpuUsage').textContent = d.cpu_total_used.toFixed(1) + '%';
-                }
-                if (d.cpu_model) {
-                    document.getElementById('cpuModel').textContent = d.cpu_model + ' (' + (d.cpu_cores || '?') + ' cores)';
-                }
-                renderCpuBars(d.cpu_per_core);
-                if (d.mem_percent !== undefined) {
-                    document.getElementById('memUsage').textContent = d.mem_percent.toFixed(0) + '%';
-                    document.getElementById('memDetails').textContent = (d.mem_used_human||'-') + ' / ' + (d.mem_total_human||'-');
-                }
-                if (d.uptime_human) {
-                    document.getElementById('uptime').textContent = d.uptime_human;
-                }
-                // Disk I/O
-                if (d.disk_read_speed_human) {
-                    document.getElementById('diskIO').textContent = d.disk_read_speed_human;
-                    document.getElementById('diskIOSub').textContent = 'Write: ' + (d.disk_write_speed_human || '-');
-                }
-                // Network I/O
-                if (d.net_rx_speed_human) {
-                    document.getElementById('netIO').textContent = d.net_rx_speed_human + ' in';
-                    document.getElementById('netIOSub').textContent = (d.net_tx_speed_human || '-') + ' out';
-                }
-            }).catch(() => {});
+            // FIX #2: Prevent request stacking
+            if (updateCpuInFlight) {
+                console.warn('updateCpu: Previous request still in flight, skipping');
+                return;
+            }
+            updateCpuInFlight = true;
+
+            // FIX #1: Add timeout to prevent hanging requests
+            const controller = new AbortController();
+            const timeoutId = setTimeout(() => controller.abort(), 15000); // 15 second timeout
+
+            fetch('/api/cpu', { signal: controller.signal })
+                .then(r => {
+                    clearTimeout(timeoutId);
+                    return r.json();
+                })
+                .then(d => {
+                    // FIX #4: Mark backend as healthy on success
+                    backendHealth.consecutiveFailures = 0;
+                    backendHealth.lastSuccessTime = Date.now();
+                    backendHealth.isHealthy = true;
+
+                    if (d.cpu_total_used !== undefined) {
+                        document.getElementById('cpuUsage').textContent = d.cpu_total_used.toFixed(1) + '%';
+                    }
+                    if (d.cpu_model) {
+                        document.getElementById('cpuModel').textContent = d.cpu_model + ' (' + (d.cpu_cores || '?') + ' cores)';
+                    }
+                    renderCpuBars(d.cpu_per_core);
+                    if (d.mem_percent !== undefined) {
+                        document.getElementById('memUsage').textContent = d.mem_percent.toFixed(0) + '%';
+                        document.getElementById('memDetails').textContent = (d.mem_used_human||'-') + ' / ' + (d.mem_total_human||'-');
+                    }
+                    if (d.uptime_human) {
+                        document.getElementById('uptime').textContent = d.uptime_human;
+                    }
+                    // Disk I/O
+                    if (d.disk_read_speed_human) {
+                        document.getElementById('diskIO').textContent = d.disk_read_speed_human;
+                        document.getElementById('diskIOSub').textContent = 'Write: ' + (d.disk_write_speed_human || '-');
+                    }
+                    // Network I/O
+                    if (d.net_rx_speed_human) {
+                        document.getElementById('netIO').textContent = d.net_rx_speed_human + ' in';
+                        document.getElementById('netIOSub').textContent = (d.net_tx_speed_human || '-') + ' out';
+                    }
+
+                    updateCpuInFlight = false;
+                })
+                .catch(e => {
+                    clearTimeout(timeoutId);
+                    updateCpuInFlight = false;
+
+                    // FIX #3 & #4: Improve error handling and backend health tracking
+                    backendHealth.consecutiveFailures++;
+                    if (backendHealth.consecutiveFailures >= 3) {
+                        backendHealth.isHealthy = false;
+                    }
+
+                    const errMsg = e.name === 'AbortError' ? 'System stats timeout' : 'System stats error';
+                    console.error('updateCpu error:', errMsg, e);
+
+                    // FIX #3: Show visual feedback for system stats errors
+                    if (backendHealth.consecutiveFailures >= 3) {
+                        document.getElementById('statusText').textContent = 'Backend Unhealthy';
+                        document.getElementById('statusDot').className = 'status-dot status-error';
+                    }
+                });
         }
 
         function renderCpuBars(cores) {
@@ -1762,7 +1850,14 @@ DASHBOARD_HTML = '''<!DOCTYPE html>
         }
 
         function update() {
-            // Add timeout to prevent hanging
+            // FIX #2: Prevent request stacking
+            if (updateInFlight) {
+                console.warn('update: Previous request still in flight, skipping');
+                return;
+            }
+            updateInFlight = true;
+
+            // FIX #1: Add timeout to prevent hanging (already present, kept)
             const controller = new AbortController();
             const timeoutId = setTimeout(() => controller.abort(), 15000); // 15 second timeout
 
@@ -1774,11 +1869,24 @@ DASHBOARD_HTML = '''<!DOCTYPE html>
                 .then(d => {
                 if (d.error) {
                     lastData = null;  // Stop interpolation on error
+                    updateInFlight = false;
+
+                    // FIX #4: Track backend failures
+                    backendHealth.consecutiveFailures++;
+                    if (backendHealth.consecutiveFailures >= 3) {
+                        backendHealth.isHealthy = false;
+                    }
+
                     document.getElementById('statusText').textContent = 'Error';
                     document.getElementById('statusDot').className = 'status-dot status-error';
                     document.getElementById('fetchIndicator').className = 'fetch-indicator fetch-error';
                     return;
                 }
+
+                // FIX #4: Mark backend as healthy on success
+                backendHealth.consecutiveFailures = 0;
+                backendHealth.lastSuccessTime = Date.now();
+                backendHealth.isHealthy = true;
 
                 // Update fetch indicator to show data is fresh
                 document.getElementById('fetchIndicator').className = 'fetch-indicator fetch-fresh';
@@ -2026,14 +2134,31 @@ DASHBOARD_HTML = '''<!DOCTYPE html>
                 lastData = d;
                 lastFetchTime = Date.now();
 
+                // FIX #2: Clear request-in-flight flag
+                updateInFlight = false;
+
+                // FIX #3: Detect and warn about stale data
+                const dataAge = (Date.now() - lastFetchTime) / 1000;
+                if (dataAge > settings.blockRefresh * 2) {
+                    console.warn('Data appears stale, age:', dataAge.toFixed(0), 'seconds');
+                }
+
             }).catch(e => {
                 clearTimeout(timeoutId);
+                updateInFlight = false;
                 lastData = null;  // Stop interpolation on connection error
+
+                // FIX #4: Track backend failures
+                backendHealth.consecutiveFailures++;
+                if (backendHealth.consecutiveFailures >= 3) {
+                    backendHealth.isHealthy = false;
+                }
+
                 const errMsg = e.name === 'AbortError' ? 'Request Timeout' : 'Connection Error';
                 document.getElementById('statusText').textContent = errMsg;
                 document.getElementById('statusDot').className = 'status-dot status-error';
                 document.getElementById('fetchIndicator').className = 'fetch-indicator fetch-error';
-                console.error('API fetch error:', e);
+                console.error('API fetch error:', e, '| Consecutive failures:', backendHealth.consecutiveFailures);
             });
         }
 
@@ -2042,6 +2167,25 @@ DASHBOARD_HTML = '''<!DOCTYPE html>
             if (cpuRefreshInterval) clearInterval(cpuRefreshInterval);
             blockRefreshInterval = setInterval(update, settings.blockRefresh * 1000);
             cpuRefreshInterval = setInterval(updateCpu, settings.cpuRefresh * 1000);
+        }
+
+        // FIX #3 & #4: Periodic backend health check
+        function checkBackendHealth() {
+            const now = Date.now();
+            const timeSinceSuccess = (now - backendHealth.lastSuccessTime) / 1000;
+
+            // If no successful request in 2 minutes, warn user
+            if (timeSinceSuccess > 120) {
+                console.warn('Backend unhealthy - no successful requests for', timeSinceSuccess.toFixed(0), 'seconds');
+                // Update status to show degraded state
+                if (backendHealth.consecutiveFailures >= 5) {
+                    document.getElementById('statusText').textContent = 'Backend Disconnected';
+                    document.getElementById('statusDot').className = 'status-dot status-error';
+                } else if (backendHealth.consecutiveFailures >= 3) {
+                    document.getElementById('statusText').textContent = 'Backend Degraded';
+                    document.getElementById('statusDot').className = 'status-dot status-error';
+                }
+            }
         }
 
         // Initialize
@@ -2057,6 +2201,9 @@ DASHBOARD_HTML = '''<!DOCTYPE html>
         // Setup refresh intervals
         setupIntervals();
         setInterval(interpolate, 1000);  // Smooth block updates every 1s
+
+        // FIX #3 & #4: Check backend health every 30 seconds
+        setInterval(checkBackendHealth, 30000);
     </script>
 </body>
 </html>'''
