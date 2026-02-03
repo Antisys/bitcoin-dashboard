@@ -53,6 +53,10 @@ last_disk_result = {'disk_read_speed': 0, 'disk_write_speed': 0}
 prev_net_stats = {'timestamp': 0, 'rx_bytes': 0, 'tx_bytes': 0}
 last_net_result = {'net_rx_speed': 0, 'net_tx_speed': 0}
 
+# Bitcoin network tracking
+prev_btc_net = {'timestamp': 0, 'totalbytesrecv': 0, 'totalbytessent': 0}
+last_btc_net_result = {'btc_download_speed': 0, 'btc_upload_speed': 0}
+
 
 def run_command(cmd, timeout=15):
     try:
@@ -248,6 +252,36 @@ def get_network_io():
 
     if not stats:
         stats = last_net_result.copy()
+    return stats
+
+
+def get_btc_network_speed():
+    global prev_btc_net, last_btc_net_result
+    stats = {}
+    current_time = time.time()
+
+    nettotals = run_bitcoin_cli("getnettotals")
+    if not nettotals:
+        return last_btc_net_result.copy()
+
+    try:
+        data = json.loads(nettotals)
+        total_recv = data.get('totalbytesrecv', 0)
+        total_sent = data.get('totalbytessent', 0)
+
+        if prev_btc_net['timestamp'] > 0:
+            time_diff = current_time - prev_btc_net['timestamp']
+            if time_diff > 0:
+                stats['btc_download_speed'] = (total_recv - prev_btc_net['totalbytesrecv']) / time_diff
+                stats['btc_upload_speed'] = (total_sent - prev_btc_net['totalbytessent']) / time_diff
+                last_btc_net_result.update(stats)
+
+        prev_btc_net = {'timestamp': current_time, 'totalbytesrecv': total_recv, 'totalbytessent': total_sent}
+    except json.JSONDecodeError:
+        pass
+
+    if not stats:
+        stats = last_btc_net_result.copy()
     return stats
 
 
@@ -604,6 +638,7 @@ DASHBOARD_HTML = '''<!DOCTYPE html>
         }
         .card-value { font-size: 1.8em; font-weight: bold; color: #fff; word-break: break-word; }
         .card-value-small { font-size: 1.1em; font-weight: bold; color: #fff; word-break: break-word; }
+        .card-value-tiny { font-size: 0.9em; font-weight: bold; color: #fff; word-break: break-word; }
         .card-sub { font-size: 0.9em; color: #666; margin-top: 5px; }
 
         .progress-container {
@@ -793,13 +828,18 @@ DASHBOARD_HTML = '''<!DOCTYPE html>
                 <div class="card-sub" id="connSub">-</div>
             </div>
             <div class="card">
+                <div class="card-title">Download Speed</div>
+                <div class="card-value" id="btcDownload">-</div>
+                <div class="card-sub" id="btcDownloadSub">blockchain sync</div>
+            </div>
+            <div class="card">
                 <div class="card-title">Disk Usage</div>
                 <div class="card-value" id="diskUsage">-</div>
                 <div class="card-sub" id="diskSub">-</div>
             </div>
             <div class="card">
                 <div class="card-title">Version</div>
-                <div class="card-value-small" id="version">-</div>
+                <div class="card-value-tiny" id="version">-</div>
                 <div class="card-sub" id="versionSub">-</div>
             </div>
             <div class="card">
@@ -820,11 +860,6 @@ DASHBOARD_HTML = '''<!DOCTYPE html>
                 <div class="card-title">Mempool Size</div>
                 <div class="card-value" id="mempoolSize">-</div>
                 <div class="card-sub" id="mempoolSizeSub">-</div>
-            </div>
-            <div class="card">
-                <div class="card-title">Min Fee</div>
-                <div class="card-value" id="mempoolFee">-</div>
-                <div class="card-sub">sat/vB minimum</div>
             </div>
         </div>
 
@@ -1084,6 +1119,12 @@ DASHBOARD_HTML = '''<!DOCTYPE html>
                 document.getElementById('connections').textContent = d.connections || 0;
                 document.getElementById('connSub').textContent = (d.connections_in||0) + ' in / ' + (d.connections_out||0) + ' out';
 
+                // Bitcoin download speed
+                if (d.btc_download_speed_human) {
+                    document.getElementById('btcDownload').textContent = d.btc_download_speed_human;
+                    document.getElementById('btcDownloadSub').textContent = 'upload: ' + (d.btc_upload_speed_human || '-');
+                }
+
                 document.getElementById('diskUsage').textContent = d.size_on_disk_human || '-';
                 document.getElementById('diskSub').textContent = d.pruned ? 'pruned' : 'full node';
 
@@ -1114,10 +1155,6 @@ DASHBOARD_HTML = '''<!DOCTYPE html>
                     const maxMb = (d.mempool_maxmempool || 300000000) / (1024 * 1024);
                     document.getElementById('mempoolSize').textContent = mb.toFixed(1) + ' MB';
                     document.getElementById('mempoolSizeSub').textContent = 'of ' + maxMb.toFixed(0) + ' MB max';
-                }
-                if (d.mempool_minfee !== undefined) {
-                    const satPerVb = d.mempool_minfee * 100000;
-                    document.getElementById('mempoolFee').textContent = satPerVb.toFixed(2);
                 }
 
                 // System stats
@@ -1217,6 +1254,11 @@ class DashboardHandler(http.server.BaseHTTPRequestHandler):
                 # Add latest block
                 latest = get_latest_block()
                 stats.update(latest)
+                # Add Bitcoin network speed
+                btc_net = get_btc_network_speed()
+                stats.update(btc_net)
+                stats['btc_download_speed_human'] = format_speed(btc_net.get('btc_download_speed', 0))
+                stats['btc_upload_speed_human'] = format_speed(btc_net.get('btc_upload_speed', 0))
             else:
                 stats = {'error': 'Could not fetch stats'}
 
