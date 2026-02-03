@@ -706,27 +706,30 @@ def get_bitcoin_stats():
         # Use cached data
         blockchain_data = blockchain_cache['data']
     else:
-        # Fetch new data
-        if not stats.get('assumeutxo'):
-            info = run_bitcoin_cli("getblockchaininfo")
-            if info:
-                try:
-                    blockchain_data = json.loads(info)
-                    blockchain_cache['data'] = blockchain_data
-                    blockchain_cache['last_update'] = now
-                except json.JSONDecodeError:
-                    pass
+        # Fetch new data - always fetch to get size_on_disk even in assumeutxo mode
+        info = run_bitcoin_cli("getblockchaininfo")
+        if info:
+            try:
+                blockchain_data = json.loads(info)
+                blockchain_cache['data'] = blockchain_data
+                blockchain_cache['last_update'] = now
+            except json.JSONDecodeError:
+                pass
 
     # Use blockchain data if available
-    if blockchain_data and not stats.get('assumeutxo'):
-        stats['height'] = blockchain_data.get('blocks', 0)
-        stats['headers'] = blockchain_data.get('headers', 0)
-        stats['progress'] = blockchain_data.get('verificationprogress', 0) * 100
-        stats['ibd'] = blockchain_data.get('initialblockdownload', True)
+    if blockchain_data:
+        # Always get size_on_disk and pruned status
         stats['size_on_disk'] = blockchain_data.get('size_on_disk', 0)
         stats['pruned'] = blockchain_data.get('pruned', False)
-        if detected_mode == 'unknown':
-            detected_mode = 'normal'
+
+        # Only use height/headers/progress in normal mode (assumeutxo gets these from getchainstates)
+        if not stats.get('assumeutxo'):
+            stats['height'] = blockchain_data.get('blocks', 0)
+            stats['headers'] = blockchain_data.get('headers', 0)
+            stats['progress'] = blockchain_data.get('verificationprogress', 0) * 100
+            stats['ibd'] = blockchain_data.get('initialblockdownload', True)
+            if detected_mode == 'unknown':
+                detected_mode = 'normal'
 
     # Mode confirmation logic - sticky once confirmed
     if detected_mode != 'unknown':
