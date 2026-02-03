@@ -693,10 +693,9 @@ def enforce_knots_preference():
 
 def get_disk_estimate():
     stats = {}
-    # Full blockchain is approximately 650GB as of 2024, growing ~60GB/year
-    # At block 880,000 (approx current), size is ~650GB
-    ESTIMATED_FULL_SIZE_GB = 700  # Conservative estimate
-    BLOCKS_TOTAL = 880000  # Approximate current tip
+    # Recent blocks (2023-2026) average ~2-3 MB due to SegWit and increased usage
+    # Early blocks (2009-2015) were tiny (~100 KB average)
+    # Using average block size across ALL blocks severely underestimates space needed
 
     info = run_bitcoin_cli("getblockchaininfo")
     if info:
@@ -707,13 +706,28 @@ def get_disk_estimate():
             headers = data.get('headers', 0)
 
             if current_blocks > 0 and headers > current_blocks:
-                # Estimate based on current progress
-                size_per_block = current_size / current_blocks
                 remaining_blocks = headers - current_blocks
-                estimated_remaining = size_per_block * remaining_blocks
-                stats['disk_needed_bytes'] = estimated_remaining
+
+                # Use realistic recent block size estimates based on current block height
+                if current_blocks >= 800000:
+                    # Modern blocks (2023+): ~2.5 MB average
+                    avg_recent_block_size = 2.5 * 1024 * 1024  # 2.5 MB in bytes
+                elif current_blocks >= 600000:
+                    # 2019-2022: ~1.5 MB average
+                    avg_recent_block_size = 1.5 * 1024 * 1024
+                else:
+                    # Older blocks: use actual average (less accurate but better than nothing)
+                    avg_recent_block_size = current_size / current_blocks if current_blocks > 0 else 1024 * 1024
+
+                estimated_remaining = remaining_blocks * avg_recent_block_size
+                stats['disk_needed_bytes'] = int(estimated_remaining)
                 stats['disk_needed_human'] = format_bytes(estimated_remaining)
                 stats['disk_total_estimate'] = current_size + estimated_remaining
+
+                # Add note if estimate seems off
+                if remaining_blocks > 100000:
+                    stats['disk_estimate_note'] = 'Large sync remaining, estimate may vary'
+
         except json.JSONDecodeError:
             pass
     return stats
