@@ -74,12 +74,13 @@ timed_cache = {
 }
 
 # Disk I/O tracking
-prev_disk_stats = {'timestamp': 0, 'read_bytes': 0, 'write_bytes': 0}
-last_disk_result = {'disk_read_speed': 0, 'disk_write_speed': 0}
+prev_disk_stats = {'timestamp': 0, 'read_bytes': 0, 'write_bytes': 0, 'io_time_ms': 0}
+last_disk_result = {'disk_read_speed': 0, 'disk_write_speed': 0, 'disk_utilization': 0}
 
 # Network I/O tracking
 prev_net_stats = {'timestamp': 0, 'rx_bytes': 0, 'tx_bytes': 0}
-last_net_result = {'net_rx_speed': 0, 'net_tx_speed': 0}
+last_net_result = {'net_rx_speed': 0, 'net_tx_speed': 0, 'net_utilization': 0}
+net_link_speed_mbps = None  # Cached link speed
 
 # Bitcoin network tracking
 prev_btc_net = {'timestamp': 0, 'totalbytesrecv': 0, 'totalbytessent': 0}
@@ -382,6 +383,7 @@ def get_disk_io():
 
     total_read = 0
     total_write = 0
+    total_io_time_ms = 0
     for line in diskstats.split('\n'):
         parts = line.split()
         if len(parts) >= 14:
@@ -390,22 +392,82 @@ def get_disk_io():
             if device.startswith('sd') and device[-1].isalpha():
                 total_read += int(parts[5]) * 512  # sectors read * 512 bytes
                 total_write += int(parts[9]) * 512  # sectors written * 512 bytes
+                total_io_time_ms += int(parts[12])  # time spent doing I/O (ms)
             elif device.startswith('nvme') and device.endswith('n1'):
                 total_read += int(parts[5]) * 512
                 total_write += int(parts[9]) * 512
+                total_io_time_ms += int(parts[12])
 
     if prev_disk_stats['timestamp'] > 0:
         time_diff = current_time - prev_disk_stats['timestamp']
         if time_diff > 0:
             stats['disk_read_speed'] = (total_read - prev_disk_stats['read_bytes']) / time_diff
             stats['disk_write_speed'] = (total_write - prev_disk_stats['write_bytes']) / time_diff
+            # Calculate disk utilization as percentage of time spent doing I/O
+            io_time_diff_ms = total_io_time_ms - prev_disk_stats['io_time_ms']
+            time_diff_ms = time_diff * 1000
+            stats['disk_utilization'] = min(100, (io_time_diff_ms / time_diff_ms) * 100)
             last_disk_result.update(stats)
 
-    prev_disk_stats = {'timestamp': current_time, 'read_bytes': total_read, 'write_bytes': total_write}
+    prev_disk_stats = {'timestamp': current_time, 'read_bytes': total_read, 'write_bytes': total_write, 'io_time_ms': total_io_time_ms}
 
     if not stats:
         stats = last_disk_result.copy()
     return stats
+
+
+def get_network_link_speed():
+    """Detect network link speed in Mbps"""
+    global net_link_speed_mbps
+    if net_link_speed_mbps is not None:
+        return net_link_speed_mbps
+
+    # Find active interface
+    route_output = run_command("ip route get 8.8.8.8")
+    if not route_output:
+        net_link_speed_mbps = 1000  # Default to 1 Gbps
+        return net_link_speed_mbps
+
+    # Extract interface name
+    iface = None
+    for part in route_output.split():
+        if part.startswith('dev'):
+            idx = route_output.split().index(part)
+            if idx + 1 < len(route_output.split()):
+                iface = route_output.split()[idx + 1]
+                break
+
+    if not iface:
+        net_link_speed_mbps = 1000
+        return net_link_speed_mbps
+
+    # Try WiFi first (iwconfig)
+    if iface.startswith('wl'):
+        iwconfig = run_command(f"iwconfig {iface}")
+        if iwconfig and 'Bit Rate' in iwconfig:
+            import re
+            match = re.search(r'Bit Rate[=:](\d+\.?\d*)\s*([GM]b/s)', iwconfig)
+            if match:
+                speed = float(match.group(1))
+                unit = match.group(2)
+                if unit == 'Gb/s':
+                    net_link_speed_mbps = speed * 1000
+                else:
+                    net_link_speed_mbps = speed
+                return net_link_speed_mbps
+
+    # Try ethtool for wired
+    ethtool = run_command(f"ethtool {iface}")
+    if ethtool and 'Speed:' in ethtool:
+        import re
+        match = re.search(r'Speed:\s*(\d+)Mb/s', ethtool)
+        if match:
+            net_link_speed_mbps = int(match.group(1))
+            return net_link_speed_mbps
+
+    # Default to 1 Gbps if detection fails
+    net_link_speed_mbps = 1000
+    return net_link_speed_mbps
 
 
 def get_network_io():
@@ -437,6 +499,15 @@ def get_network_io():
         if time_diff > 0:
             stats['net_rx_speed'] = (total_rx - prev_net_stats['rx_bytes']) / time_diff
             stats['net_tx_speed'] = (total_tx - prev_net_stats['tx_bytes']) / time_diff
+
+            # Calculate network utilization as % of link speed
+            link_speed_mbps = get_network_link_speed()
+            max_bytes_per_sec = (link_speed_mbps * 1000000) / 8  # Mbps to bytes/sec
+            # Use the higher of RX or TX for utilization
+            max_speed = max(stats['net_rx_speed'], stats['net_tx_speed'])
+            stats['net_utilization'] = min(100, (max_speed / max_bytes_per_sec) * 100)
+            stats['net_link_speed_mbps'] = link_speed_mbps
+
             last_net_result.update(stats)
 
     prev_net_stats = {'timestamp': current_time, 'rx_bytes': total_rx, 'tx_bytes': total_tx}
@@ -460,7 +531,13 @@ def get_btc_network_speed():
         total_recv = data.get('totalbytesrecv', 0)
         total_sent = data.get('totalbytessent', 0)
 
+        # Detect node restart: if counters went backwards, reset baseline
         if prev_btc_net['timestamp'] > 0:
+            if total_recv < prev_btc_net['totalbytesrecv'] or total_sent < prev_btc_net['totalbytessent']:
+                # Node restarted, counters reset - establish new baseline
+                prev_btc_net = {'timestamp': current_time, 'totalbytesrecv': total_recv, 'totalbytessent': total_sent}
+                return last_btc_net_result.copy()
+
             time_diff = current_time - prev_btc_net['timestamp']
             if time_diff > 0:
                 stats['btc_download_speed'] = (total_recv - prev_btc_net['totalbytesrecv']) / time_diff
@@ -545,6 +622,9 @@ def get_peer_info():
     cache = timed_cache['peers']
     if now - cache['last_update'] < cache['ttl']:
         # Return cached data
+        # Also update knots_pref counts from cache
+        knots_pref['knots_count'] = cache['knots']
+        knots_pref['core_count'] = cache['core']
         return {
             'peers': cache['value'],
             'peer_count': cache['count'],
@@ -1405,6 +1485,11 @@ DASHBOARD_HTML = '''<!DOCTYPE html>
         .stat-value { font-size: 1.1em; font-weight: bold; color: var(--text-primary); margin-top: 2px; }
         .stat-sub { font-size: 0.75em; color: var(--text-muted); }
 
+        /* Utilization color coding */
+        .util-ok { color: #4CAF50 !important; }  /* Green: 0-50% */
+        .util-warning { color: #FF9800 !important; }  /* Bitcoin Orange: 50-80% */
+        .util-critical { color: #f44336 !important; }  /* Red: 80-100% */
+
         .footer { text-align: center; color: var(--text-muted); margin-top: 30px; font-size: 0.9em; }
 
         .fetch-indicator {
@@ -1655,7 +1740,7 @@ DASHBOARD_HTML = '''<!DOCTYPE html>
         <h2>System Resources</h2>
         <div class="system-grid">
             <div class="card card-wide">
-                <div class="card-title">CPU <span id="cpuUsage" style="float:right;font-size:1.2em;">-</span></div>
+                <div class="card-title">CPU</div>
                 <div class="card-sub" id="cpuModel" style="margin-bottom:10px;">-</div>
                 <div class="cpu-bars" id="cpuBars"></div>
                 <div class="cpu-legend">
@@ -1668,14 +1753,14 @@ DASHBOARD_HTML = '''<!DOCTYPE html>
                 <div class="card-title">System</div>
                 <div class="stats-compact">
                     <div class="stat-item">
+                        <div class="stat-label">CPU</div>
+                        <div class="stat-value" id="cpuUsage">-</div>
+                        <div class="stat-sub">total usage</div>
+                    </div>
+                    <div class="stat-item">
                         <div class="stat-label">Memory</div>
                         <div class="stat-value" id="memUsage">-</div>
                         <div class="stat-sub" id="memDetails">-</div>
-                    </div>
-                    <div class="stat-item">
-                        <div class="stat-label">Temp</div>
-                        <div class="stat-value" id="cpuTemp">-</div>
-                        <div class="stat-sub" id="tempSub">-</div>
                     </div>
                     <div class="stat-item">
                         <div class="stat-label">Disk I/O</div>
@@ -1687,9 +1772,14 @@ DASHBOARD_HTML = '''<!DOCTYPE html>
                         <div class="stat-value" id="netIO">-</div>
                         <div class="stat-sub" id="netIOSub">-</div>
                     </div>
-                    <div class="stat-item" style="grid-column: span 2;">
+                    <div class="stat-item">
+                        <div class="stat-label">Temp</div>
+                        <div class="stat-value" id="cpuTemp">-</div>
+                        <div class="stat-sub" id="tempSub">-</div>
+                    </div>
+                    <div class="stat-item">
                         <div class="stat-label">Uptime</div>
-                        <div class="stat-value" id="uptime">-</div>
+                        <div class="stat-value" id="uptime" style="font-size:0.9em;">-</div>
                     </div>
                 </div>
             </div>
@@ -1880,6 +1970,12 @@ DASHBOARD_HTML = '''<!DOCTYPE html>
 
         function fmt(n) { return n.toLocaleString(); }
 
+        function getUtilClass(percent) {
+            if (percent < 50) return 'util-ok';
+            if (percent < 80) return 'util-warning';
+            return 'util-critical';
+        }
+
         function resetBars() {
             document.getElementById('barBottom').style.width = '0%';
             document.getElementById('barTop').style.left = '0%';
@@ -2034,28 +2130,36 @@ DASHBOARD_HTML = '''<!DOCTYPE html>
                     backendHealth.isHealthy = true;
 
                     if (d.cpu_total_used !== undefined) {
-                        document.getElementById('cpuUsage').textContent = d.cpu_total_used.toFixed(1) + '%';
+                        const cpuEl = document.getElementById('cpuUsage');
+                        cpuEl.textContent = d.cpu_total_used.toFixed(1) + '%';
+                        cpuEl.className = 'stat-value ' + getUtilClass(d.cpu_total_used);
                     }
                     if (d.cpu_model) {
                         document.getElementById('cpuModel').textContent = d.cpu_model + ' (' + (d.cpu_cores || '?') + ' cores)';
                     }
                     renderCpuBars(d.cpu_per_core);
                     if (d.mem_percent !== undefined) {
-                        document.getElementById('memUsage').textContent = d.mem_percent.toFixed(0) + '%';
+                        const memEl = document.getElementById('memUsage');
+                        memEl.textContent = d.mem_percent.toFixed(0) + '%';
+                        memEl.className = 'stat-value ' + getUtilClass(d.mem_percent);
                         document.getElementById('memDetails').textContent = (d.mem_used_human||'-') + ' / ' + (d.mem_total_human||'-');
                     }
                     if (d.uptime_human) {
                         document.getElementById('uptime').textContent = d.uptime_human;
                     }
                     // Disk I/O
-                    if (d.disk_read_speed_human) {
-                        document.getElementById('diskIO').textContent = d.disk_read_speed_human;
-                        document.getElementById('diskIOSub').textContent = 'Write: ' + (d.disk_write_speed_human || '-');
+                    if (d.disk_utilization !== undefined) {
+                        const diskEl = document.getElementById('diskIO');
+                        diskEl.textContent = d.disk_utilization.toFixed(1) + '%';
+                        diskEl.className = 'stat-value ' + getUtilClass(d.disk_utilization);
+                        document.getElementById('diskIOSub').textContent = 'R: ' + (d.disk_read_speed_human || '-') + ' | W: ' + (d.disk_write_speed_human || '-');
                     }
                     // Network I/O
-                    if (d.net_rx_speed_human) {
-                        document.getElementById('netIO').textContent = d.net_rx_speed_human + ' in';
-                        document.getElementById('netIOSub').textContent = (d.net_tx_speed_human || '-') + ' out';
+                    if (d.net_utilization !== undefined) {
+                        const netEl = document.getElementById('netIO');
+                        netEl.textContent = d.net_utilization.toFixed(1) + '%';
+                        netEl.className = 'stat-value ' + getUtilClass(d.net_utilization);
+                        document.getElementById('netIOSub').textContent = '↓ ' + (d.net_rx_speed_human || '-') + ' | ↑ ' + (d.net_tx_speed_human || '-');
                     }
 
                     updateCpuInFlight = false;
@@ -2242,7 +2346,11 @@ DASHBOARD_HTML = '''<!DOCTYPE html>
                 // Common stats
 
                 document.getElementById('connections').textContent = d.connections || 0;
-                document.getElementById('connSub').textContent = (d.connections_in||0) + ' in / ' + (d.connections_out||0) + ' out';
+                let connSubText = (d.connections_in||0) + ' in / ' + (d.connections_out||0) + ' out';
+                if (d.knots_pref_enabled) {
+                    connSubText += '\\nKnots: ' + (d.knots_pref_knots_count||0) + ' | Core: ' + (d.knots_pref_core_count||0) + ' | Dropped: ' + (d.knots_pref_disconnected||0);
+                }
+                document.getElementById('connSub').textContent = connSubText;
 
                 // Bitcoin download speed
                 if (d.btc_download_speed_human) {
@@ -2311,26 +2419,34 @@ DASHBOARD_HTML = '''<!DOCTYPE html>
 
                 // System stats
                 if (d.cpu_total_used !== undefined) {
-                    document.getElementById('cpuUsage').textContent = d.cpu_total_used.toFixed(1) + '%';
+                    const cpuEl = document.getElementById('cpuUsage');
+                    cpuEl.textContent = d.cpu_total_used.toFixed(1) + '%';
+                    cpuEl.className = 'stat-value ' + getUtilClass(d.cpu_total_used);
                 }
                 document.getElementById('cpuModel').textContent = (d.cpu_model || '-') + ' (' + (d.cpu_cores || '?') + ' cores)';
                 renderCpuBars(d.cpu_per_core);
 
                 if (d.mem_percent !== undefined) {
-                    document.getElementById('memUsage').textContent = d.mem_percent.toFixed(0) + '%';
+                    const memEl = document.getElementById('memUsage');
+                    memEl.textContent = d.mem_percent.toFixed(0) + '%';
+                    memEl.className = 'stat-value ' + getUtilClass(d.mem_percent);
                     document.getElementById('memDetails').textContent = (d.mem_used_human||'-') + ' / ' + (d.mem_total_human||'-');
                 }
 
                 // Disk I/O
-                if (d.disk_read_speed_human) {
-                    document.getElementById('diskIO').textContent = d.disk_read_speed_human;
-                    document.getElementById('diskIOSub').textContent = 'Write: ' + (d.disk_write_speed_human || '-');
+                if (d.disk_utilization !== undefined) {
+                    const diskEl = document.getElementById('diskIO');
+                    diskEl.textContent = d.disk_utilization.toFixed(1) + '%';
+                    diskEl.className = 'stat-value ' + getUtilClass(d.disk_utilization);
+                    document.getElementById('diskIOSub').textContent = 'R: ' + (d.disk_read_speed_human || '-') + ' | W: ' + (d.disk_write_speed_human || '-');
                 }
 
                 // Network I/O
-                if (d.net_rx_speed_human) {
-                    document.getElementById('netIO').textContent = d.net_rx_speed_human + ' in';
-                    document.getElementById('netIOSub').textContent = (d.net_tx_speed_human || '-') + ' out';
+                if (d.net_utilization !== undefined) {
+                    const netEl = document.getElementById('netIO');
+                    netEl.textContent = d.net_utilization.toFixed(1) + '%';
+                    netEl.className = 'stat-value ' + getUtilClass(d.net_utilization);
+                    document.getElementById('netIOSub').textContent = '↓ ' + (d.net_rx_speed_human || '-') + ' | ↑ ' + (d.net_tx_speed_human || '-');
                 }
 
                 document.getElementById('uptime').textContent = d.uptime_human || '-';
@@ -2583,6 +2699,8 @@ class DashboardHandler(http.server.BaseHTTPRequestHandler):
                 # Add Knots preference status
                 stats['knots_pref_enabled'] = knots_pref['enabled']
                 stats['knots_pref_disconnected'] = knots_pref['disconnected_count']
+                stats['knots_pref_knots_count'] = knots_pref['knots_count']
+                stats['knots_pref_core_count'] = knots_pref['core_count']
 
                 # Run Knots preference enforcement if enabled
                 if knots_pref['enabled']:
@@ -2704,8 +2822,12 @@ def warmup_cache():
 
             # Initialize network speed tracking (needs 2 calls to calculate speed)
             get_btc_network_speed()  # First call establishes baseline
+            get_disk_io()  # Initialize disk I/O baseline
+            get_network_io()  # Initialize network I/O baseline
             time.sleep(3)  # Wait a bit for some data transfer
             get_btc_network_speed()  # Second call calculates initial speed
+            get_disk_io()  # Second call calculates disk utilization
+            get_network_io()  # Second call calculates network speeds
 
             print("Cache warmup complete")
         except Exception as e:
