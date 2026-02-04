@@ -46,9 +46,9 @@ chart_history = deque(maxlen=30)
 # Knots peer preference settings (enabled by default)
 knots_pref = {
     'enabled': True,
-    'min_connections': 8,
+    'min_connections': 5,  # More aggressive - drop Core peers earlier
     'last_disconnect': 0,
-    'cooldown': 300,  # 5 minutes between disconnects
+    'cooldown': 60,  # 1 minute between disconnects (more aggressive)
     'disconnected_count': 0,
     'knots_count': 0,
     'core_count': 0,
@@ -713,15 +713,26 @@ def enforce_knots_preference():
         if 'knots' in subver_lower:
             knots_count += 1
             continue
-        # Check for v30+ (Satoshi:30, Satoshi:31, etc.)
-        if 'satoshi:30' in subver_lower or 'satoshi:31' in subver_lower or 'satoshi:32' in subver_lower:
-            v30_peers.append(peer)
-        elif 'satoshi' in subver_lower:
-            other_core_peers.append(peer)
+        # Check for v30+ (Satoshi:30, Satoshi:31, Satoshi:32, etc.)
+        # Match any version 30 or higher (up to 39)
+        if 'satoshi' in subver_lower:
+            # Extract version number
+            import re
+            match = re.search(r'satoshi:(\d+)', subver_lower)
+            if match:
+                version = int(match.group(1))
+                if version >= 30:
+                    v30_peers.append(peer)
+                else:
+                    other_core_peers.append(peer)
+            else:
+                # Couldn't parse version, treat as other Core
+                other_core_peers.append(peer)
 
-    # AGGRESSIVE: Always drop v30+ immediately, no cooldown, even below min connections
-    # Only keep v30 if it's literally our only connection
-    if v30_peers and total_peers > 1:
+    # AGGRESSIVE: Always drop Core v30+ immediately, no cooldown
+    # Drop v30+ as long as we have other connections (non-v30 peers)
+    non_v30_peers = total_peers - len(v30_peers)
+    if v30_peers and non_v30_peers > 0:
         peer = v30_peers[0]
         addr = peer.get('addr', '')
         run_bitcoin_cli(f'disconnectnode "{addr}"')
@@ -731,7 +742,8 @@ def enforce_knots_preference():
             'addr': addr,
             'subver': peer.get('subver', ''),
             'total_disconnected': knots_pref['disconnected_count'],
-            'reason': 'v30+ aggressive drop'
+            'non_v30_peers': non_v30_peers,
+            'reason': 'Core v30+ immediate drop (ancient version)'
         }
 
     # For other Core peers, use normal cooldown
@@ -1240,6 +1252,8 @@ DASHBOARD_HTML = '''<!DOCTYPE html>
     <meta http-equiv="Cache-Control" content="no-cache, no-store, must-revalidate">
     <meta http-equiv="Pragma" content="no-cache">
     <meta http-equiv="Expires" content="0">
+    <!-- Favicon -->
+    <link rel="icon" type="image/svg+xml" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'><circle cx='32' cy='32' r='30' fill='%230a0a0a' stroke='%23f7931a' stroke-width='3'/><text x='32' y='42' font-family='Arial' font-size='40' font-weight='bold' fill='%23f7931a' text-anchor='middle'>₿</text></svg>">
     <!-- Version: 2.1.0 - Fixed interpolation and added fetch indicator -->
     <style>
         :root {
@@ -1646,8 +1660,13 @@ DASHBOARD_HTML = '''<!DOCTYPE html>
 <body>
     <div class="container">
         <div class="header-row">
-            <div style="width: 40px;"></div>
-            <h1>&#8383; Bitcoin Knots Dashboard</h1>
+            <div style="width: 40px;">
+                <svg width="40" height="40" viewBox="0 0 64 64" style="display: block;">
+                    <circle cx="32" cy="32" r="30" fill="#0a0a0a" stroke="#f7931a" stroke-width="3"/>
+                    <text x="32" y="44" font-family="Arial" font-size="42" font-weight="bold" fill="#f7931a" text-anchor="middle">₿</text>
+                </svg>
+            </div>
+            <h1>Bitcoin Knots Dashboard</h1>
             <div class="header-controls">
                 <button class="icon-btn" onclick="openSettings()" title="Settings">&#9881;</button>
             </div>
@@ -1820,23 +1839,43 @@ DASHBOARD_HTML = '''<!DOCTYPE html>
                 <label>Max Peers Shown</label>
                 <input type="number" id="settingMaxPeers" min="5" max="50" value="10">
             </div>
+
+            <!-- Bitcoin Node Settings -->
+            <div style="margin-top:20px; padding-top:15px; border-top:1px solid var(--border-color);">
+                <h3 style="font-size:0.95em; margin-bottom:10px; color:var(--bitcoin-orange);">Bitcoin Node Connection</h3>
+                <div class="form-row">
+                    <div class="form-group">
+                        <label>Bitcoin Node Address</label>
+                        <input type="text" id="settingRpcHost" placeholder="127.0.0.1 or hostname" value="127.0.0.1">
+                    </div>
+                    <div class="form-group">
+                        <label>Bitcoin Node Port</label>
+                        <input type="number" id="settingRpcPort" min="1" max="65535" value="8332">
+                    </div>
+                </div>
+                <div style="font-size:0.75em; color:var(--text-muted); margin-top:5px;">
+                    Where your Bitcoin node is running (default: localhost:8332)<br>
+                    ⚠️ Changes require dashboard restart to take effect
+                </div>
+            </div>
+
             <div class="form-group" style="margin-top:20px; padding-top:15px; border-top:1px solid var(--border-color);">
                 <label style="display:flex; align-items:center; gap:10px; cursor:pointer;">
                     <input type="checkbox" id="settingKnotsPref" style="width:auto;">
                     <span>Prefer Knots peers</span>
                 </label>
                 <div style="font-size:0.8em; color:var(--text-muted); margin-top:5px;">
-                    Slowly disconnect Core peers when above minimum connections to favor Knots nodes.
+                    Aggressively disconnect Core peers to favor Knots nodes. Core v30+ dropped immediately.
                 </div>
             </div>
             <div class="form-row" id="knotsOptions" style="display:none;">
                 <div class="form-group">
                     <label>Min Connections</label>
-                    <input type="number" id="settingKnotsMin" min="4" max="20" value="8">
+                    <input type="number" id="settingKnotsMin" min="4" max="20" value="5">
                 </div>
                 <div class="form-group">
                     <label>Cooldown (seconds)</label>
-                    <input type="number" id="settingKnotsCooldown" min="60" max="3600" value="300">
+                    <input type="number" id="settingKnotsCooldown" min="30" max="3600" value="60">
                 </div>
             </div>
             <div id="knotsStatus" style="display:none; font-size:0.85em; color:var(--text-secondary); margin-top:10px;"></div>
@@ -1873,7 +1912,7 @@ DASHBOARD_HTML = '''<!DOCTYPE html>
             maxPeers: 10
         };
         let settings = {...defaultSettings};
-        let knotsPref = {enabled: false, min_connections: 8, cooldown: 300};
+        let knotsPref = {enabled: false, min_connections: 5, cooldown: 60};
 
         // Load settings from localStorage
         function loadSettings() {
@@ -1885,6 +1924,14 @@ DASHBOARD_HTML = '''<!DOCTYPE html>
             } catch (e) {}
             applySettings();
             loadKnotsPref();
+            loadNodeConfig();
+        }
+
+        function loadNodeConfig() {
+            fetch('/api/node-config').then(r => r.json()).then(d => {
+                document.getElementById('settingRpcHost').value = d.rpc_host || '127.0.0.1';
+                document.getElementById('settingRpcPort').value = d.rpc_port || 8332;
+            }).catch(() => {});
         }
 
         function loadKnotsPref() {
@@ -1900,8 +1947,8 @@ DASHBOARD_HTML = '''<!DOCTYPE html>
             const status = document.getElementById('knotsStatus');
             cb.checked = knotsPref.enabled;
             opts.style.display = knotsPref.enabled ? 'flex' : 'none';
-            document.getElementById('settingKnotsMin').value = knotsPref.min_connections || 8;
-            document.getElementById('settingKnotsCooldown').value = knotsPref.cooldown || 300;
+            document.getElementById('settingKnotsMin').value = knotsPref.min_connections || 5;
+            document.getElementById('settingKnotsCooldown').value = knotsPref.cooldown || 60;
             if (knotsPref.enabled) {
                 status.style.display = 'block';
                 status.innerHTML = `Knots: <b>${knotsPref.knots_count || 0}</b> | Core: <b>${knotsPref.core_count || 0}</b> | Dropped: <b>${knotsPref.disconnected_count || 0}</b>`;
@@ -1929,14 +1976,27 @@ DASHBOARD_HTML = '''<!DOCTYPE html>
 
             // Save Knots preference to server
             const knotsEnabled = document.getElementById('settingKnotsPref').checked;
-            const knotsMin = parseInt(document.getElementById('settingKnotsMin').value) || 8;
-            const knotsCooldown = parseInt(document.getElementById('settingKnotsCooldown').value) || 300;
+            const knotsMin = parseInt(document.getElementById('settingKnotsMin').value) || 5;
+            const knotsCooldown = parseInt(document.getElementById('settingKnotsCooldown').value) || 60;
             fetch('/api/knots-pref', {
                 method: 'POST',
                 headers: {'Content-Type': 'application/json'},
                 body: JSON.stringify({enabled: knotsEnabled, min_connections: knotsMin, cooldown: knotsCooldown})
             }).then(r => r.json()).then(d => {
                 knotsPref = {...knotsPref, ...d};
+            }).catch(() => {});
+
+            // Save Node config to server
+            const rpcHost = document.getElementById('settingRpcHost').value || '127.0.0.1';
+            const rpcPort = parseInt(document.getElementById('settingRpcPort').value) || 8332;
+            fetch('/api/node-config', {
+                method: 'POST',
+                headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify({rpc_host: rpcHost, rpc_port: rpcPort})
+            }).then(r => r.json()).then(d => {
+                if (d.restart_required) {
+                    alert('Node config saved. Dashboard restart required to apply changes.');
+                }
             }).catch(() => {});
 
             closeSettings();
@@ -1974,6 +2034,20 @@ DASHBOARD_HTML = '''<!DOCTYPE html>
             if (percent < 50) return 'util-ok';
             if (percent < 80) return 'util-warning';
             return 'util-critical';
+        }
+
+        function getTempClass(temp, isCpu = true) {
+            // CPU: Green <60°C, Orange 60-80°C, Red >80°C
+            // NVMe: Green <50°C, Orange 50-70°C, Red >70°C
+            if (isCpu) {
+                if (temp < 60) return 'util-ok';
+                if (temp < 80) return 'util-warning';
+                return 'util-critical';
+            } else {
+                if (temp < 50) return 'util-ok';
+                if (temp < 70) return 'util-warning';
+                return 'util-critical';
+            }
         }
 
         function resetBars() {
@@ -2453,12 +2527,16 @@ DASHBOARD_HTML = '''<!DOCTYPE html>
 
                 // Temperature
                 if (d.cpu_temp !== undefined) {
-                    document.getElementById('cpuTemp').textContent = d.cpu_temp.toFixed(0) + '°C';
+                    const cpuTempEl = document.getElementById('cpuTemp');
+                    cpuTempEl.textContent = d.cpu_temp.toFixed(0) + '°C';
+                    cpuTempEl.className = 'stat-value ' + getTempClass(d.cpu_temp, true);
+
                     let tempSub = 'CPU';
                     if (d.nvme_temp !== undefined) {
-                        tempSub += ' | NVMe: ' + d.nvme_temp.toFixed(0) + '°C';
+                        const nvmeClass = getTempClass(d.nvme_temp, false);
+                        tempSub += ' | NVMe: <span class="' + nvmeClass + '">' + d.nvme_temp.toFixed(0) + '°C</span>';
                     }
-                    document.getElementById('tempSub').textContent = tempSub;
+                    document.getElementById('tempSub').innerHTML = tempSub;
                 }
 
                 // Peer list
@@ -2759,6 +2837,17 @@ class DashboardHandler(http.server.BaseHTTPRequestHandler):
             }
             self.wfile.write(json.dumps(response).encode())
 
+        elif path == '/api/node-config':
+            self.send_response(200)
+            self.send_header('Content-type', 'application/json')
+            self.send_header('Access-Control-Allow-Origin', '*')
+            self.end_headers()
+            response = {
+                'rpc_host': CONFIG['rpc_host'],
+                'rpc_port': CONFIG['rpc_port']
+            }
+            self.wfile.write(json.dumps(response).encode())
+
         else:
             self.send_response(404)
             self.end_headers()
@@ -2788,6 +2877,30 @@ class DashboardHandler(http.server.BaseHTTPRequestHandler):
                     'enabled': knots_pref['enabled'],
                     'min_connections': knots_pref['min_connections'],
                     'cooldown': knots_pref['cooldown']
+                }
+            except (json.JSONDecodeError, ValueError) as e:
+                response = {'success': False, 'error': str(e)}
+
+            self.wfile.write(json.dumps(response).encode())
+
+        elif path == '/api/node-config':
+            self.send_response(200)
+            self.send_header('Content-type', 'application/json')
+            self.send_header('Access-Control-Allow-Origin', '*')
+            self.end_headers()
+
+            try:
+                data = json.loads(body)
+                if 'rpc_host' in data:
+                    CONFIG['rpc_host'] = str(data['rpc_host'])
+                if 'rpc_port' in data:
+                    CONFIG['rpc_port'] = max(1, min(65535, int(data['rpc_port'])))
+
+                response = {
+                    'success': True,
+                    'rpc_host': CONFIG['rpc_host'],
+                    'rpc_port': CONFIG['rpc_port'],
+                    'restart_required': True
                 }
             except (json.JSONDecodeError, ValueError) as e:
                 response = {'success': False, 'error': str(e)}
